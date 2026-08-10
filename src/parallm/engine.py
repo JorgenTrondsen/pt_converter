@@ -37,6 +37,7 @@ from typing import Sequence
 import torch
 from torch import nn
 
+from parallm.adapters import AttnOps
 from parallm.model.pt_model import PTWrappedModel
 
 
@@ -63,6 +64,13 @@ class GridStacked:
     weights from something else — `parallm.model.batched.MergedShadow` serves them
     as views of ONE merged parameter, which is how a merged track runs unfused.
     """
+
+    #: Where the served family's attention differs from the plain form (see
+    #: `parallm.adapters.AttnOps`). The decode providers below are Qwen3.5-only by
+    #: construction — the GDN fold and the replica pool are written to its shapes —
+    #: so they pin its flavour here. `MergedShadow` (the training-side fold, which IS
+    #: family-agnostic) overrides this from its adapter.
+    attn_ops = AttnOps(gated_q=True, centered_norm=True)
 
     def stacked(self, li: int, path: str) -> torch.Tensor:
         """The N tracks' param at ``path`` stacked ``[N, ...]`` (cached). A
@@ -710,49 +718,98 @@ def _assign_param(module, dotted: str, tensor: torch.Tensor) -> None:
 # the batch dim. Every rank runs the same shadow chain on the same inputs,
 # preserving the rank-bit-identical carry.
 # --------------------------------------------------------------------------- #
+_HF_MOD = None
+
+
 def _hf():
-    """The Qwen3.5 modeling module, resolved at call time so its FLA/CUDA
-    kernel bindings (monkeypatched to None on CPU test runs) stay authoritative."""
-    from transformers.models.qwen3_5 import modeling_qwen3_5 as m
-    return m
+    """The Qwen3.5 modeling module, resolved at first call so its FLA/CUDA
+    kernel bindings (monkeypatched to None on CPU test runs) stay authoritative.
+
+    Memoized in a module global rather than imported per call because `_batched_attn`
+    runs INSIDE a compiled region: an ``import`` statement is a hard graph break, and
+    dynamo split every attention half into two fragments reached through a resume
+    trampoline. Past the first call this is a global read of a module object, which
+    dynamo constant-folds. `enable_batched_compile` warms it so the very first trace
+    is already past the import.
+
+    The GDN fold genuinely needs THIS family's module. `_batched_attn` takes only
+    ``apply_rotary_pos_emb`` and ``repeat_kv`` from it, which are the standard
+    rotate-half rope and GQA expand — byte-identical across every Llama-derived
+    family, Qwen3 included. That reuse is pinned by the batched-equivalence rails,
+    which compare the fold against the family's OWN modules."""
+    global _HF_MOD
+    if _HF_MOD is None:
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as m
+
+        _HF_MOD = m
+    return _HF_MOD
 
 
-def _rms_tracks(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    """Per-track Qwen3.5 RMSNorm (zero-centered weight) on ``x [N, ..., d]``.
+def _norm_eps(norm) -> float:
+    """An RMSNorm module's epsilon. HF is not consistent about the attribute name —
+    Qwen3.5 stores ``eps``, Qwen3 stores ``variance_epsilon``."""
+    eps = getattr(norm, "eps", None)
+    return float(eps if eps is not None else norm.variance_epsilon)
+
+
+def _rms_tracks(
+    x: torch.Tensor, w: torch.Tensor, eps: float, centered: bool
+) -> torch.Tensor:
+    """Per-track RMSNorm on ``x [N, ..., d]``.
 
     ``w`` is ``[N, d]`` when each of the N streams owns one copy, or ``[N, F, d]``
     when a stream is a GROUP of F members that each kept their own — the middle
     dims are right-aligned against x's, so the broadcast lands on the head axis
     either way. The ``[N, d]`` form reproduces the previous view exactly.
+
+    ``centered`` is `AttnOps.centered_norm`: Qwen3.5 applies ``(1 + w)``, Qwen3 (and
+    the plain Llama form) applies ``w`` directly.
     """
     xf = x.float()
     out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    wv = (1.0 + w.float()).view(w.shape[0], *([1] * (x.ndim - w.ndim)), *w.shape[1:])
+    wf = 1.0 + w.float() if centered else w.float()
+    wv = wf.view(w.shape[0], *([1] * (x.ndim - w.ndim)), *w.shape[1:])
     return (out * wv).type_as(x)
 
 
 def _batched_attn(shadow, li: int, x, position_embeddings, attention_mask, cache):
     """All N tracks' full-attention mixers → per-track deltas ``[N, B, T, h]``.
-    Mirrors ``Qwen3_5Attention.forward`` with the track dim folded into batch.
-    ``x`` is the shared residual ``[B, T, h]`` or a per-track one ``[N, B, T, h]``
-    (see `_norm_flat`); everything downstream of the projections is per-track
-    either way, because attention never mixes heads."""
+    The attention forward with the track dim folded into batch. ``x`` is the shared
+    residual ``[B, T, h]`` or a per-track one ``[N, B, T, h]`` (see `_norm_flat`);
+    everything downstream of the projections is per-track either way, because
+    attention never mixes heads.
+
+    Family-independent except for `shadow.attn_ops` (see `parallm.adapters.AttnOps`):
+    Qwen3.5 doubles ``q_proj`` into ``[q | gate]`` and gates the output, Qwen3 does
+    not. Head dims, scaling, kv groups and eps all come off the skeleton layer."""
     m = _hf()
+    ops = shadow.attn_ops
     layer0 = shadow.grid[0][li]
     attn = layer0.self_attn
     N, B, T = shadow.n_tracks, x.shape[-3], x.shape[-2]
     d = attn.head_dim
     h2 = _norm_flat(layer0.input_layernorm, x, B, T)
-    q, gate = shadow.blinear(li, "self_attn.q_proj", h2).view(N, B, T, -1, 2 * d).chunk(2, dim=-1)
-    q = _rms_tracks(q, shadow.stacked(li, "self_attn.q_norm.weight"), attn.q_norm.eps)
+    qw = shadow.blinear(li, "self_attn.q_proj", h2)
+    if ops.gated_q:
+        q, gate = qw.view(N, B, T, -1, 2 * d).chunk(2, dim=-1)
+    else:
+        q, gate = qw.view(N, B, T, -1, d), None
+    q = _rms_tracks(q, shadow.stacked(li, "self_attn.q_norm.weight"),
+                    _norm_eps(attn.q_norm), ops.centered_norm)
     k = shadow.blinear(li, "self_attn.k_proj", h2).view(N, B, T, -1, d)
-    k = _rms_tracks(k, shadow.stacked(li, "self_attn.k_norm.weight"), attn.k_norm.eps)
+    k = _rms_tracks(k, shadow.stacked(li, "self_attn.k_norm.weight"),
+                    _norm_eps(attn.k_norm), ops.centered_norm)
     v = shadow.blinear(li, "self_attn.v_proj", h2)
     q = q.reshape(N * B, T, -1, d).transpose(1, 2)
     k = k.reshape(N * B, T, -1, d).transpose(1, 2)
     v = v.reshape(N * B, T, -1, d).transpose(1, 2)
     cos, sin = position_embeddings
-    if B > 1:  # track-major batch: row n*B+b must read position row b
+    # Condition on the ROTARY's own batch dim, not on B: a family whose
+    # `_resolve_position_ids` returns one shared row (Qwen3, matching
+    # `Qwen3Model.forward`) hands back `[1, T, d]`, which already broadcasts over the
+    # track-major batch. Only a genuinely per-row cos has to be tiled, and then row
+    # n*B+b must read position row b — which is what `repeat` gives.
+    if cos.shape[0] > 1:
         cos, sin = cos.repeat(N, 1, 1), sin.repeat(N, 1, 1)
     q, k = m.apply_rotary_pos_emb(q, k, cos, sin)
     if cache is not None:
@@ -773,7 +830,9 @@ def _batched_attn(shadow, li: int, x, position_embeddings, attention_mask, cache
         attn_mask=mask, scale=attn.scaling,
         is_causal=cache is None and mask is None and T > 1,
     )
-    o = o.transpose(1, 2).reshape(N, B * T, -1) * torch.sigmoid(gate.reshape(N, B * T, -1))
+    o = o.transpose(1, 2).reshape(N, B * T, -1)
+    if gate is not None:
+        o = o * torch.sigmoid(gate.reshape(N, B * T, -1))
     y = shadow.blinear(li, "self_attn.o_proj", o, per_track=True)
     return y.view(N, B, T, -1)
 

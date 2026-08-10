@@ -411,7 +411,9 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mem-report", action="store_true")
     p.add_argument("--compile", choices=["off", "mixer", "mlp", "both"], default="off",
-                   help="torch.compile the decoder-layer seam halves. The profiled step "
+                   help="torch.compile the decoder-layer seam halves, on whichever track "
+                        "representation is live (the looped seam AND the batched fold). "
+                        "The profiled step "
                         "is ~75%% BACKWARD, and compiling the forward gives inductor the "
                         "backward too, so this is the lever that reaches the dominant "
                         "phase. 'mixer' skips the MLP, for a sparse-MoE whose "

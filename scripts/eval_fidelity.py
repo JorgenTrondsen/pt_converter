@@ -192,8 +192,10 @@ def main() -> int:
     # ----- Student. Same construction as the train script so the loaded
     # state_dict aligns 1:1 with the safetensors keys. -----
     _log(rank, f"[init] building PT student for tracks {layout.local_track_ids}…")
+    # A VLM snapshot wraps the text config; a text-only family (gpt-oss, qwen3)
+    # ships a FLAT one. Same guard as every other script.
     student = PTWrappedModel(
-        text_config=cfg.text_config,
+        text_config=getattr(cfg, "text_config", cfg),
         n_tracks=manifest.n_tracks,
         local_track_ids=layout.local_track_ids,
         sync_after_layers=sync_layers,

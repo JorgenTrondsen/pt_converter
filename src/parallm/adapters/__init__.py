@@ -21,6 +21,27 @@ from parallm.utils.max_tracks import ConstraintSet
 
 
 @dataclass(frozen=True)
+class AttnOps:
+    """The two full-attention facts the BATCHED fold cannot read off a module.
+
+    `engine._batched_attn` reimplements a family's attention with the track dim
+    folded into the batch, so it cannot call the family's own modules and has to be
+    told where they differ. Everything else it needs (head_dim, scaling, kv groups,
+    eps) it reads off the per-stream skeleton layer.
+
+    Defaults are the PLAIN forms — a q_proj that is just `num_heads * head_dim`, and
+    an RMSNorm whose weight multiplies directly. Qwen3.5 (and its MoE sibling) set
+    both flags; see `parallm.model.batched`.
+    """
+
+    #: `q_proj` carries `[q | gate]` doubled per head, and the attention output is
+    #: multiplied by `sigmoid(gate)` (`GatedQColwise` on the slicer side).
+    gated_q: bool = False
+    #: The per-head RMSNorm weight is zero-centered, i.e. applied as `(1 + w)`.
+    centered_norm: bool = False
+
+
+@dataclass(frozen=True)
 class ModelAdapter:
     """All callbacks the PT engine needs to convert and run one model family.
 
@@ -73,6 +94,9 @@ class ModelAdapter:
     # each stream carries its own residual, so the shared router picks a different
     # top-k per stream and there is no single `grouped_mm` to issue.
     supports_batched_exec: bool = True
+    # Where this family's attention differs from the plain form the batched fold
+    # assumes. Only read when `supports_batched_exec` is True.
+    attn_ops: AttnOps = AttnOps()
 
     def layer_types_for(self, text_cfg) -> list[str]:
         """The per-layer type list, via `get_layer_types` or the config default."""
@@ -120,5 +144,6 @@ def list_registered() -> list[str]:
 
 # Import-time adapter registrations. Add one line per shipped adapter.
 from parallm.adapters import gpt_oss as _gpt_oss  # noqa: E402,F401
+from parallm.adapters import qwen3 as _qwen3  # noqa: E402,F401
 from parallm.adapters import qwen3_5 as _qwen3_5  # noqa: E402,F401
 from parallm.adapters import qwen3_5_moe as _qwen3_5_moe  # noqa: E402,F401

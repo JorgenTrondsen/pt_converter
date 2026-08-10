@@ -11,7 +11,7 @@ from typing import Any
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-from parallm.adapters import ModelAdapter, register_model_adapter
+from parallm.adapters import AttnOps, ModelAdapter, register_model_adapter
 from parallm.model.tracks.qwen3_5 import (
     PTTrackTextModel,
     build_per_track_text_config,
@@ -47,6 +47,9 @@ QWEN3_5_ADAPTER = ModelAdapter(
     build_masks=build_masks,
     full_text_model_cls=Qwen3_5TextModel,
     constraints=_qwen3_5_constraints,
+    # `q_proj` carries [q | gate] (`GatedQColwise`) and the RMSNorm weight is
+    # zero-centered — the two places `engine._batched_attn` has to branch.
+    attn_ops=AttnOps(gated_q=True, centered_norm=True),
 )
 
 register_model_adapter(QWEN3_5_ADAPTER)

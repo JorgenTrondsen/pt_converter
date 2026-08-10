@@ -10,7 +10,7 @@ from typing import Any
 
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeTextModel
 
-from parallm.adapters import ModelAdapter, register_model_adapter
+from parallm.adapters import AttnOps, ModelAdapter, register_model_adapter
 from parallm.model.tracks.qwen3_5_moe import (
     PTTrackTextModel,
     build_per_track_text_config,
@@ -57,6 +57,10 @@ QWEN3_5_MOE_ADAPTER = ModelAdapter(
     # G > 1 each stream carries its own residual, so the shared router picks a
     # different top-k per stream and there is no single `grouped_mm` to issue.
     supports_batched_exec=False,
+    # Inert while the fold is off, but stated rather than defaulted: this family
+    # reuses the dense Qwen3.5 attention verbatim, so the plain default would be
+    # silently wrong numbers if the flag above ever flipped.
+    attn_ops=AttnOps(gated_q=True, centered_norm=True),
 )
 
 register_model_adapter(QWEN3_5_MOE_ADAPTER)

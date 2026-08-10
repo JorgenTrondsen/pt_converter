@@ -40,6 +40,7 @@ from parallm.engine import (
     _batched_attn,
     _batched_gdn,
     _batched_mlp,
+    _hf,
     _submodule,
 )
 from parallm.slicer.base import GDNFusedQKV, Replicated
@@ -66,6 +67,10 @@ class MergedShadow:
                  group_width: int = 1):
         self.n_tracks = n_groups          # the fold's "N" is the number of STREAMS
         self.group_width = group_width    # members pooled inside each stream
+        self._fold_paths: dict[str, tuple[str, ...]] = {}
+        # Where THIS family's attention differs from the plain form the fold assumes
+        # (gated q_proj, zero-centered norm). `engine._batched_attn` reads it.
+        self.attn_ops = adapter.attn_ops
         self._layers = text_model.layers
         self._specs = resolve_param_specs(adapter, text_config)
         n_shards = text_model.pt_cfg.n_tracks * n_groups * group_width
@@ -135,6 +140,22 @@ class MergedShadow:
         # member axis brought to the front for the batched matmul.
         return w.unflatten(dim, (self.n_tracks, -1)).movedim(dim, 0)
 
+    def layer_fold(self, li: int, prefix: str) -> "_LayerFold":
+        """ONE layer's ``prefix`` weights, resolved for the compiled region.
+
+        Path lists are cached per prefix, not per layer: every full-attention layer
+        carries the same parameter NAMES, and so does every GDN one, so the first
+        layer to ask for a prefix answers for all of them. The TENSORS are resolved
+        fresh on every call — `stacked` must not cache (see its docstring).
+        """
+        paths = self._fold_paths.get(prefix)
+        if paths is None:
+            head = f"layers.{li}.{prefix}"
+            paths = tuple(k[len(f"layers.{li}."):] for k in self._specs
+                          if k.startswith(head))
+            self._fold_paths[prefix] = paths
+        return _LayerFold(self, li, paths)
+
     def _regroup_qkv(self, w: torch.Tensor, li: int) -> torch.Tensor:
         """``GDNFusedQKV`` merges SEGMENT-major — ``[Q0..Q_{K-1} | K0.. | V0..]`` —
         because the merged track's own forward splits its slab as ``[Q|K|V]``. The
@@ -151,6 +172,95 @@ class MergedShadow:
         )
 
 
+class _LayerFold:
+    """ONE layer's stacked weights, resolved BEFORE the compiled region.
+
+    `torch.compile` SPECIALIZES ON PYTHON INTS, and `engine._batched_*` indexes its
+    provider by the layer index. Handing a compiled callable that int recompiles the
+    whole graph per layer: dynamo reported ``li == 7``, the walk hit
+    ``recompile_limit`` (8) after 8 layers and ran the remaining 56 EAGER — slower
+    than not compiling at all. Resolving the weights here makes the compiled function
+    take TENSORS and one nn.Module, both of which dynamo treats as graph inputs, so
+    the graph count is set by the two SHAPES a residual arrives in (shared ``[B,T,H]``
+    out of a sync, per-member ``[G,B,T,H]`` mid-window) and is independent of DEPTH —
+    which is what `tests/test_qwen3_slice.py` asserts.
+
+    Serves the same provider interface the fold reads off a shadow — ``n_tracks``,
+    ``attn_ops``, ``grid``, ``blinear``, ``stacked`` — with ``li`` accepted and
+    IGNORED, so `engine._batched_*` and the decode providers stay untouched.
+    """
+
+    __slots__ = ("n_tracks", "attn_ops", "grid", "_w")
+
+    def __init__(self, shadow, li: int, paths):
+        self.n_tracks = shadow.n_tracks
+        self.attn_ops = shadow.attn_ops
+        self.grid = [[shadow.grid[0][li]]]
+        self._w = {p: shadow.stacked(li, p) for p in paths}
+
+    def stacked(self, li: int, path: str) -> torch.Tensor:
+        return self._w[path]
+
+    def blinear(self, li: int, rel: str, x: torch.Tensor,
+                per_track: bool = False) -> torch.Tensor:
+        return torch.matmul(x, self._w[f"{rel}.weight"].transpose(-2, -1))
+
+
+def _fold_attn(fold, x, position_embeddings, attention_mask):
+    """The compiled unit: one layer's attention half over a resolved fold."""
+    return x + _batched_attn(fold, 0, x, position_embeddings, attention_mask, None)
+
+
+def _fold_mlp(fold, x):
+    """The compiled unit: one layer's MLP half over a resolved fold."""
+    return x + _batched_mlp(fold, 0, x)
+
+
+_COMPILED: dict[str, object] = {}
+
+
+def enable_batched_compile(
+    mode: str = "both", dynamic: bool | None = False, inductor_mode: str = "default"
+) -> None:
+    """`seam.enable_seam_compile` for the batched fold — the path a family with
+    ``supports_batched_exec`` takes at every F, INCLUDING the frozen teacher, whose
+    own walk is a `PTWrappedModel` at the exact schedule.
+
+    Called by `seam.enable_seam_compile` so one ``--compile`` flag covers both track
+    representations. A caller never picks between them: which one runs is decided by
+    ``exec_groups``, not by the user, and before this the flag silently compiled
+    nothing whenever the batched path was live.
+
+    The GDN half is deliberately absent — `engine._batched_gdn` calls FLA /
+    ``causal_conv1d`` kernels that would break the graph anyway, so
+    `batched_token_mixer` keeps it on the eager branch.
+    """
+    if mode not in ("mixer", "mlp", "both"):
+        raise ValueError(f"compile mode must be mixer|mlp|both, got {mode!r}")
+    if inductor_mode == "reduce-overhead":
+        raise ValueError(
+            "reduce-overhead (CUDA graphs) is not supported for the track walk: a "
+            "graph's output pool is reused by the next per-layer invocation while the "
+            "backward still needs those tensors."
+        )
+    _hf()  # resolve the modeling module before the first trace: its import is a break
+    kw = {"dynamic": dynamic}
+    if inductor_mode != "default":
+        kw["mode"] = inductor_mode
+    if mode in ("mixer", "both"):
+        _COMPILED["mixer"] = torch.compile(_fold_attn, **kw)
+    if mode in ("mlp", "both"):
+        _COMPILED["mlp"] = torch.compile(_fold_mlp, **kw)
+
+
+def _attn_fn():
+    return _COMPILED.get("mixer", _fold_attn)
+
+
+def _mlp_fn():
+    return _COMPILED.get("mlp", _fold_mlp)
+
+
 def batched_token_mixer(shadow, li, x, position_embeddings, attention_mask, position_ids):
     """`seam.seam_token_mixer` for a merged track run as G members.
 
@@ -161,15 +271,20 @@ def batched_token_mixer(shadow, li, x, position_embeddings, attention_mask, posi
 
     ``position_ids`` is accepted for signature parity with `seam.seam_token_mixer`
     and unused: the fold consumes the precomputed rotary embeddings directly.
+
+    ``block_type`` is Qwen3.5's hybrid marker; a family with only self-attention has
+    no such attribute, hence the ``getattr`` — the same guard `seam.seam_token_mixer`
+    and `train.teacher.HookedTeacher._attn_submodule` use.
     """
-    if shadow.grid[0][li].block_type == "linear_attention":
+    if getattr(shadow.grid[0][li], "block_type", None) == "linear_attention":
         return x + _batched_gdn(shadow, li, x, attention_mask, None)
-    return x + _batched_attn(shadow, li, x, position_embeddings, attention_mask, None)
+    return _attn_fn()(shadow.layer_fold(li, "self_attn."), x,
+                      position_embeddings, attention_mask)
 
 
 def batched_seam_mlp(shadow, li, x):
     """`seam.seam_mlp` for a merged track run as G members."""
-    return x + _batched_mlp(shadow, li, x)
+    return _mlp_fn()(shadow.layer_fold(li, "mlp."), x)
 
 
 def batched_halves(shadow, use_ckpt: bool, position_embeddings, position_ids):

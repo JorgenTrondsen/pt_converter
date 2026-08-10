@@ -69,6 +69,13 @@ def enable_seam_compile(
     The profiled step is ~75% BACKWARD, which is the point: compiling the forward
     gives inductor the backward too, so this is the only built lever that touches the
     dominant phase.
+
+    Compiles the BATCHED fold's halves as well (`model.batched.enable_batched_compile`,
+    imported here rather than at module scope because that module imports the engine).
+    Which of the two representations runs is decided by ``exec_groups``, never by the
+    caller, so a flag that reached only these two functions compiled NOTHING for any
+    family running the batched path — which is every family with
+    ``supports_batched_exec``, at every F.
     """
     if mode not in ("mixer", "mlp", "both"):
         raise ValueError(f"compile mode must be mixer|mlp|both, got {mode!r}")
@@ -85,6 +92,10 @@ def enable_seam_compile(
         _COMPILED["mixer"] = torch.compile(seam_token_mixer, **kw)
     if mode in ("mlp", "both"):
         _COMPILED["mlp"] = torch.compile(seam_mlp, **kw)
+
+    from parallm.model.batched import enable_batched_compile
+
+    enable_batched_compile(mode, dynamic=dynamic, inductor_mode=inductor_mode)
 
 
 def _mixer_fn():

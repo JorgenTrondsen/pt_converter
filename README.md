@@ -101,7 +101,7 @@ torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
 ```
 src/parallm/
 ├── slicer/         # dense → N per-track state dicts + PTManifest (base.py specs, convert.py engine, qwen3_5.py specs)
-├── adapters/       # model-family registry (qwen3_5 slicer specs + per-track class)
+├── adapters/       # model-family registry (qwen3, qwen3_5, qwen3_5_moe, gpt_oss)
 ├── model/
 │   ├── pt_model.py     # PTWrappedModel: per-rank lockstep forward over K tracks + SyncBoundary
 │   ├── sync.py         # SyncBoundary: the one cross-track all-reduce

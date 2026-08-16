@@ -41,7 +41,7 @@ from parallm.eval.fidelity import fidelity_step
 from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.data import (
-    DEFAULT_PRESET,
+    DEFAULT_MIXTURE,
     CalibrationDataConfig,
     PackedTokenStream,
     parse_source_spec,
@@ -63,13 +63,12 @@ def main() -> int:
     p.add_argument("--checkpoint-dir", required=True,
                    help="Per-rank checkpoint dir with track_*.safetensors and manifest.json "
                         "(e.g. ./pt_train_out/best, ./pt_train_out/final, or a step_N dir).")
-    p.add_argument("--data-preset", default=DEFAULT_PRESET, choices=preset_names(),
-                   help="Streamed eval mixture (DEFAULT). 'qwen-mix' is the training mixture, so "
-                        "fidelity is measured on the SAME distribution the student was distilled on "
-                        "(directly comparable to the training val_kl). Reads the held-out FRONT slice "
-                        "(--skip-docs 0) — the docs the default training val held out. NOTE: qwen-mix's "
-                        "the-stack-dedup is GATED (export HF_TOKEN), or pass --data-preset slimpajama / "
-                        "--dataset-name. Overridden by --data-source or --dataset-name.")
+    p.add_argument("--data-preset", default=DEFAULT_MIXTURE,
+                   help=f"Streamed eval mixture: a name under configs/data (have: {preset_names()}) "
+                        "or a path to any mixture JSON. The default matches the trainer's, so "
+                        "fidelity is measured on the SAME distribution the student was distilled "
+                        "on. Reads the front of the stream (--skip-docs 0). Overridden by "
+                        "--data-source or --dataset-name.")
     p.add_argument("--data-source", action="append", default=None, metavar="NAME[:CONFIG[:KEY[:WEIGHT]]]",
                    help="Custom eval source(s), repeatable; if any given it REPLACES --data-preset.")
     p.add_argument("--dataset-name", default=None,

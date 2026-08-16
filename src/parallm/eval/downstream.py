@@ -1,50 +1,77 @@
 """Downstream (lm-eval) scoring for the student.
 
 Collapses an lm-eval ``simple_evaluate`` results dict into the program's reported
-numbers. Pure dict arithmetic, so it is unit-testable on CPU without the
-``[eval]`` extra or a GPU — keep this module free of top-level ``torch`` /
-``lm_eval`` imports.
+numbers, and owns the task set itself so the trainer's in-loop macro and a
+standalone rescore cannot drift apart. Pure dict arithmetic, so it is unit-testable
+on CPU without the ``[eval]`` extra or a GPU — keep this module free of top-level
+``torch`` / ``lm_eval`` imports.
 """
 from __future__ import annotations
 
-# The program's downstream convention: acc_norm where the task reports a
-# length-normalized accuracy, plain acc otherwise. NOT a global acc_norm→acc
-# priority — arc_easy/arc_challenge report acc_norm too, and taking it would
-# give a different number than every result recorded in logs/.
-MACRO_TASK_METRIC = {
-    "hellaswag": "acc_norm", "piqa": "acc_norm",
-    "arc_easy": "acc", "arc_challenge": "acc", "winogrande": "acc",
-}
+from pathlib import Path
+
+# Repo-root ``configs/eval_tasks`` — extra lm-eval task YAMLs, resolved off the
+# package rather than cwd (ranks launch via torchrun from varying directories).
+# Passed to lm-eval as a TaskManager include_path, which is what lets a task over
+# an arbitrary hub dataset be added by dropping in a YAML, with no code change.
+EVAL_TASK_PATH = str(Path(__file__).resolve().parents[3] / "configs" / "eval_tasks")
+
+# The macro task set, shared by the trainer's in-loop eval and the standalone
+# script so the two report the same number: reasoning (arc_easy / arc_challenge),
+# math (mmlu_pro_math_mc) and code (codemmlu_fim).
+#
+# Changing this changes what "macro" means and silently voids comparability with
+# every macro= already recorded in logs/ — re-baseline rather than compare across
+# a change. Pass --tasks/--eval-tasks for a one-off instead of editing this.
+DEFAULT_TASKS = "arc_easy,arc_challenge,mmlu_pro_math_mc,codemmlu_fim"
 
 
-def _pick(metrics: dict, *names: str) -> "float | None":
-    """First of ``names`` present, ignoring lm-eval's ``,<filter>`` key suffix."""
-    for name in names:
-        for key, val in metrics.items():
-            if key.split(",")[0] == name and isinstance(val, (int, float)):
-                return float(val)
+class MissingTasks(KeyError):
+    """An expected task produced no score. Never silently averaged away."""
+
+
+def _acc(metrics: dict) -> "float | None":
+    """This task's ``acc``, ignoring lm-eval's ``,<filter>`` key suffix.
+
+    Always ``acc``, never ``acc_norm``. Not because the tasks are uniform —
+    arc_easy/arc_challenge score full-sentence continuations and DO report
+    acc_norm — but because taking it would silently give a different number than
+    every result recorded in logs/. The two custom tasks score a single letter,
+    where length normalization is meaningless and only ``acc`` is emitted.
+    """
+    for key, val in metrics.items():
+        if key.split(",")[0] == "acc" and isinstance(val, (int, float)):
+            return float(val)
     return None
 
 
-def macro_metrics(results: "dict | None") -> "dict[str, float]":
-    """Each task's convention metric, keyed by task name.
+def macro_metrics(
+    results: "dict | None", tasks: "str | list[str] | None" = None
+) -> "dict[str, float]":
+    """Each EXPECTED task's ``acc``, keyed by task name.
+
+    Iterates the expected task list rather than the results table, for two reasons.
+    A group task puts its subtasks in the table alongside the group, and averaging
+    those would swamp the macro. And a task that failed to load would otherwise
+    vanish without trace — which is not a neutral failure: dropping
+    ``mmlu_pro_math_mc``, reliably the lowest scorer, *raises* the macro by ~0.07,
+    so a hub outage would read as a win and could promote a worse checkpoint.
 
     ``results`` is ``None`` on every rank but global rank 0 (``simple_evaluate``
     returns nothing elsewhere), which yields ``{}``.
     """
-    table = (results or {}).get("results", {})
-    picked = {
-        task: _pick(m, MACRO_TASK_METRIC.get(task, "acc"), "acc_norm")
-        for task, m in table.items()
-    }
-    return {task: val for task, val in picked.items() if val is not None}
-
-
-def macro_score(results: "dict | None") -> float:
-    """Mean of ``macro_metrics`` — the number checkpoints are selected on.
-
-    Averages over whatever tasks scored, so a subset run reports that subset's
-    macro; 0.0 when nothing scored. Higher is better.
-    """
-    vals = macro_metrics(results).values()
-    return sum(vals) / len(vals) if vals else 0.0
+    if not results:
+        return {}
+    table = results.get("results", {})
+    if isinstance(tasks := (DEFAULT_TASKS if tasks is None else tasks), str):
+        tasks = tasks.split(",")
+    out, missing = {}, []
+    for task in (t.strip() for t in tasks if t.strip()):
+        val = _acc(table.get(task, {}))
+        if val is None:
+            missing.append(task)
+        else:
+            out[task] = val
+    if missing:
+        raise MissingTasks(f"expected tasks did not score: {missing} (got {sorted(table)})")
+    return out

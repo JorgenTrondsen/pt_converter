@@ -44,8 +44,8 @@ def get_calib_batches(tokenizer, n_batches: int, seq_len: int):
     try:
         from torch.utils.data import DataLoader
 
-        from parallm.train.data import CalibrationDataConfig, PackedTokenStream, preset_sources
-        cfg = CalibrationDataConfig(sources=preset_sources("wikitext"), seq_len=seq_len, seed=0)
+        from parallm.train.data import CalibrationDataConfig, PackedTokenStream
+        cfg = CalibrationDataConfig.single(seq_len=seq_len, seed=0)  # defaults to wikitext-103
         loader = DataLoader(PackedTokenStream(tokenizer, cfg), batch_size=1)
         out = []
         for b in loader:

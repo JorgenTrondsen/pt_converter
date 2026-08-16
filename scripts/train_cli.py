@@ -35,10 +35,14 @@ from transformers import AutoConfig, AutoTokenizer
 
 from parallm.adapters import get_adapter_for_config
 from parallm.dist.groups import build_groups
+# Constants only — downstream.py is deliberately free of torch/lm_eval imports, so
+# this stays cheap and a train-only install (no [eval] extra) still imports.
+from parallm.eval.downstream import DEFAULT_TASKS, EVAL_TASK_PATH
 from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.profile import PhaseTimer
 from parallm.train.data import (
+    DEFAULT_MIXTURE,
     CalibrationDataConfig,
     PackedTokenStream,
     parse_source_spec,
@@ -376,16 +380,25 @@ def main() -> int:
     p.add_argument("--sync-attention-heads", action="store_true",
                    help="force_sync the diverged-by-default attention head params (legacy A/B)")
     # Data.
-    p.add_argument("--data-preset", default="open-mix", choices=preset_names())
+    p.add_argument("--data-preset", default=DEFAULT_MIXTURE,
+                   help=f"Mixture name under configs/data (have: {preset_names()}) or a path to "
+                        "any mixture JSON — pointing a run at different hub datasets needs no "
+                        "code change. A source's weight is its share of training TOKENS; the "
+                        "realized split is logged at startup.")
     p.add_argument("--data-source", action="append", default=None,
-                   help="NAME[:CONFIG[:TEXT_KEY[:WEIGHT]]] (repeatable; overrides --data-preset)")
+                   help="NAME[:CONFIG[:TEXT_KEY[:WEIGHT]]] (repeatable; overrides --data-preset). "
+                        "Plain-text sources only — use a mixture JSON for chat/template formats.")
     # Eval: lm-evaluation-harness downstream macro, the checkpoint-selection
     # metric. val_kl is deliberately gone — it has been observed to invert the
     # downstream ranking outright, so selecting on it selects on noise.
-    p.add_argument("--eval-tasks", default="hellaswag,arc_easy,arc_challenge,winogrande,piqa",
-                   help="Comma-separated lm-eval tasks. The default five are the macro "
-                        "convention; changing them changes what 'macro' means, and the number "
-                        "stops being comparable to the recorded ledger.")
+    p.add_argument("--eval-tasks", default=DEFAULT_TASKS,
+                   help="Comma-separated lm-eval tasks. The default four are the macro "
+                        "convention (reasoning / math / code); changing them changes what "
+                        "'macro' means, and the number stops being comparable to the ledger.")
+    p.add_argument("--eval-task-path", default=EVAL_TASK_PATH,
+                   help="Directory of extra lm-eval task YAMLs (default: the repo's "
+                        "configs/eval_tasks). Must match the standalone eval script's, or the "
+                        "in-loop macro and a standalone rescore stop meaning the same thing.")
     p.add_argument("--eval-limit", type=int, default=200,
                    help="Requests per task. 200 matches every standalone eval in the project "
                         "history (noise ~±0.015); lower it only for smokes.")
@@ -759,7 +772,7 @@ def main() -> int:
         """
         # Lazy: lm_eval is the optional [eval] extra, so a train-only install
         # still imports this script.
-        from parallm.eval.downstream import macro_metrics
+        from parallm.eval.downstream import MissingTasks, macro_metrics
         from parallm.eval.lm_eval_adapter import (
             is_lm_head_owner, make_student_forward_fn, run_lm_eval,
         )
@@ -784,16 +797,28 @@ def main() -> int:
                 max_length=args.eval_max_length, num_fewshot=args.eval_num_fewshot,
                 seed=args.seed, log_samples=False,
                 quiet=True,  # the training log gets the numbers, not progress bars
+                include_path=args.eval_task_path,
             )
         student.train()
-        per_task = macro_metrics(results)  # populated on rank 0 only
-        score = sum(per_task.values()) / len(per_task) if per_task else 0.0
+        try:
+            per_task = macro_metrics(results, eval_tasks)  # populated on rank 0 only
+            score = sum(per_task.values()) / len(per_task) if per_task else 0.0
+        except MissingTasks as e:
+            # A task that failed to load must NOT be averaged away: the tasks span
+            # ~0.4 in accuracy, so a partial macro can beat a complete one and
+            # promote a worse checkpoint. Score it unselectable and keep training —
+            # losing the run to a hub blip would be the worse failure.
+            _log(rank, f"{tag} INCOMPLETE — not eligible for best/: {e}")
+            # -inf, not a low finite score: `best_macro` starts at -inf and the
+            # selection test is a strict `>`, so this can never win, first eval or
+            # last.
+            per_task, score = {}, float("-inf")
         # _save_checkpoint is collective and ends in dist.barrier(), so a
         # rank-local "improved?" would hang the run — broadcast rank 0's number.
         t = torch.tensor([score], dtype=torch.float64, device=torch.cuda.current_device())
         dist.broadcast(t, src=0)
-        _log(rank, f"{tag} macro={t.item():.4f} "
-                   + " ".join(f"{k}={v:.4f}" for k, v in per_task.items()))
+        _log(rank, f"{tag} macro={t.item():.4f}"
+                   + ("".join(f" {k}={v:.4f}" for k, v in per_task.items())))
         return t.item()
 
     # A kernel trace wants phase NAMES in the trace but not the phase timers' syncs,

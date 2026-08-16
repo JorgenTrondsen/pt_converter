@@ -2,11 +2,13 @@
 
 Perplexity-recovery distillation matches a frozen teacher via KL / CE / block-MSE,
 so the student only learns to match the teacher on inputs it *actually sees*. To
-recover quality across the teacher's (Qwen3.5) code/math-heavy distribution — not
-just encyclopedic English — the default is a streamable **mixture** (broad web +
-up-weighted code + math), weighted-interleaved on the fly. Swap mixtures with
-``CalibrationDataConfig.from_preset(...)``, a custom list of ``DataSourceSpec``, or
-``CalibrationDataConfig.single(...)`` for a single dataset.
+recover quality across the teacher's code/math-heavy distribution — not just
+encyclopedic English — the default is a streamable **mixture**, weighted-interleaved
+on the fly.
+
+Mixtures are JSON under ``configs/data``, not code: pointing a run at different hub
+datasets is ``--data-preset <name-or-path>``, no edit here. See ``preset_sources``
+for the schema.
 
 All sources stream (``streaming=True``): nominal dataset size is irrelevant — only
 the tokens actually consumed are fetched and then discarded, nothing is downloaded
@@ -15,18 +17,39 @@ of whether the source nominally holds 600M or 600B).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator
 
 import torch
 from torch.utils.data import IterableDataset
 
+# Mixture JSONs live at the repo root, resolved off THIS file rather than cwd:
+# ranks launch via torchrun from varying working directories.
+MIXTURE_DIR = Path(__file__).resolve().parents[3] / "configs" / "data"
+
+DEFAULT_MIXTURE = "cascade2"
+
+# Documents sampled per source to price its mean length (see `token_weights`).
+# 64 is enough to separate sources that differ by the 50x that actually matters
+# here, and is paid once at startup.
+DOC_PROBE_DOCS = 64
+
 
 @dataclass
 class DataSourceSpec:
-    """One streaming text source in a (possibly interleaved) mixture.
+    """One streaming source in a (possibly interleaved) mixture.
 
-    ``weight`` is a relative interleave probability (normalized across the mixture).
+    ``weight`` is this source's share of training **tokens** (normalized across
+    the mixture). It is NOT the interleave probability — see ``token_weights``.
+
+    ``format`` selects how a row becomes text:
+      * ``"text"``     — take ``text_key`` verbatim.
+      * ``"template"`` — ``template.format(**row)``, e.g. ``"{problem}\\n\\n{solution}"``.
+      * ``"chat"``     — run ``field`` (default ``messages``) through the tokenizer's
+        chat template. This is what lets a ``messages``-format SFT corpus be trained on.
+
     Sources must be parquet-native (standard-format) datasets — modern ``datasets``
     no longer supports script-based loaders (e.g. ``codeparrot/github-code-clean``);
     use parquet mirrors instead.
@@ -37,57 +60,182 @@ class DataSourceSpec:
     split: str = "train"
     text_key: str = "text"
     weight: float = 1.0
+    format: str = "text"
+    template: str | None = None
+    field: str | None = None
+
+    def label(self) -> str:
+        return f"{self.dataset_name}:{self.dataset_config}" if self.dataset_config else self.dataset_name
 
 
-# Named mixtures. `qwen-mix` (default) approximates Qwen3.5's code/math tilt with
-# parquet-native sources. Its code source `bigcode/the-stack-dedup` is multi-language
-# (matching Qwen better than Python-only codeparrot) but **gated**: the running HF
-# account must accept its terms at huggingface.co/datasets/bigcode/the-stack-dedup
-# AND have HF_TOKEN set, else streaming 404s. `slimpajama` (DKYoon's 6B parquet mirror,
-# already blending web/books/wiki/arxiv/github/stackexchange) and `wikitext` are both
-# ungated — use them for token-less runs.
-_PRESETS: dict[str, list[DataSourceSpec]] = {
-    "wikitext": [
-        DataSourceSpec("Salesforce/wikitext", "wikitext-103-raw-v1", text_key="text"),
-    ],
-    "slimpajama": [
-        DataSourceSpec("DKYoon/SlimPajama-6B", text_key="text"),
-    ],
-    "qwen-mix": [
-        DataSourceSpec("DKYoon/SlimPajama-6B", text_key="text", weight=0.70),
-        DataSourceSpec("open-web-math/open-web-math", text_key="text", weight=0.15),
-        DataSourceSpec("bigcode/the-stack-dedup", text_key="content", weight=0.15),  # gated; needs HF_TOKEN
-    ],
-    # qwen-mix's shape with only UNGATED sources (verified streaming anonymously
-    # from this box 2026-07-18): the code slice is codeparrot-clean (Python-only —
-    # the-stack/starcoderdata are gated). The 27B d1b-heal default.
-    "open-mix": [
-        DataSourceSpec("DKYoon/SlimPajama-6B", text_key="text", weight=0.60),
-        DataSourceSpec("open-web-math/open-web-math", text_key="text", weight=0.15),
-        DataSourceSpec("codeparrot/codeparrot-clean", text_key="content", weight=0.25),
-    ],
-}
+def _valid_messages(messages) -> bool:
+    """Structural check on a chat row: a list of ``{role: str, content: str}``.
 
-DEFAULT_PRESET = "qwen-mix"
+    Deliberately structural, not truthy. Cascade-2 opens most rows with
+    ``{"role": "system", "content": ""}``, and rejecting empty content would
+    silently drop whole subsets — a source that renders to nothing looks exactly
+    like a source that is merely down-weighted.
+    """
+    if not isinstance(messages, (list, tuple)) or not messages:
+        return False
+    return all(
+        isinstance(m, dict)
+        and isinstance(m.get("role"), str) and m["role"]
+        and isinstance(m.get("content"), str)
+        for m in messages
+    )
+
+
+def render_fn(spec: DataSourceSpec, tokenizer):
+    """Build the ``row -> {"text": str}`` mapper for one source, per ``spec.format``.
+
+    Rows that cannot be rendered yield ``""`` and are dropped by the packer's
+    empty-text check rather than raising, so one malformed row does not kill a run.
+    """
+    if spec.format == "text":
+        key = spec.text_key
+        return lambda row: {"text": row.get(key) or ""}
+
+    if spec.format == "template":
+        if not spec.template:
+            raise ValueError(f"format='template' needs a template: {spec.label()}")
+        tmpl = spec.template
+        return lambda row: {"text": tmpl.format(**row)}
+
+    if spec.format == "chat":
+        key = spec.field or "messages"
+
+        def render(row):
+            messages = row.get(key)
+            if not _valid_messages(messages):
+                return {"text": ""}
+            return {"text": tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )}
+
+        return render
+
+    raise ValueError(f"unknown source format {spec.format!r} (text|template|chat)")
+
+
+def _load_rendered(spec: DataSourceSpec, tokenizer):
+    """Stream one source and normalize it to a single ``"text"`` column.
+
+    Dropping the original columns is not cosmetic: ``interleave_datasets`` requires
+    a shared feature schema, so this is what lets a chat corpus and a plain-text
+    corpus sit in one mixture.
+    """
+    from datasets import load_dataset  # local: avoid hard dep at module load
+
+    ds = load_dataset(
+        spec.dataset_name, spec.dataset_config, split=spec.split, streaming=True,
+    )
+    return ds.map(render_fn(spec, tokenizer), remove_columns=list(ds.column_names or []))
+
+
+def mean_doc_tokens(spec: DataSourceSpec, tokenizer, stream=None) -> float:
+    """Mean tokens per *rendered* document, over the first ``DOC_PROBE_DOCS`` docs.
+
+    ``stream`` is an ALREADY-RENDERED (``{"text": ...}``-keyed) source; omit it and
+    the spec is loaded and rendered here. Either way it must be re-iterable (a hub
+    ``IterableDataset`` or a list): this probe walks it from the start and the
+    training stream then walks it again, so a one-shot generator would arrive at
+    the packer already drained.
+    """
+    if stream is None:
+        stream = _load_rendered(spec, tokenizer)
+    total, n = 0, 0
+    for row in stream:
+        text = row.get("text", "")
+        if not text:
+            continue
+        total += len(tokenizer(text, add_special_tokens=False)["input_ids"])
+        n += 1
+        if n >= DOC_PROBE_DOCS:
+            break
+    if not n:
+        raise ValueError(f"{spec.label()} rendered no non-empty documents in "
+                         f"{DOC_PROBE_DOCS} rows — check `format`/`field`/`text_key`")
+    return total / n
+
+
+def token_weights(sources: list[DataSourceSpec], lengths: list[float]) -> list[float]:
+    """Token shares -> interleave (per-document) probabilities.
+
+    ``interleave_datasets`` draws one **document** at a time, so a source's token
+    share is its document share times its mean document length. Dividing out the
+    length is what makes a declared 30% actually arrive as 30% of tokens; without
+    it, the longest source takes almost everything (Cascade-2 spans 922 to 48,340
+    tokens/doc, a 52x spread).
+    """
+    raw = [s.weight / max(n, 1e-9) for s, n in zip(sources, lengths)]
+    total = sum(raw)
+    if total <= 0:
+        raise ValueError("mixture weights sum to zero")
+    return [r / total for r in raw]
+
+
+def _log_mixture(sources, lengths, probs) -> None:
+    """Report the REALIZED split, which is the only one that matters.
+
+    Printed because nominal weights and realized weights came apart badly once and
+    nothing in the run surfaced it: a nominal 34/33/33 trained as 66/32/2.
+    """
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+    tok_total = sum(p * n for p, n in zip(probs, lengths))
+    for s, n, p in zip(sources, lengths, probs):
+        share = p * n / tok_total if tok_total else 0.0
+        print(f"[data] {s.label()}: {share:.1%} of tokens = {p:.1%} of documents "
+              f"@ {n:,.0f} tok/doc", flush=True)
+
+
+def _mixture_path(name: str) -> Path:
+    """Resolve a mixture name (under ``configs/data``) or a path to a JSON file."""
+    cand = Path(name)
+    if cand.suffix == ".json" or cand.is_file():
+        return cand
+    return MIXTURE_DIR / f"{name}.json"
 
 
 def preset_names() -> list[str]:
-    """Names of the built-in mixtures (for argparse `choices`)."""
-    return list(_PRESETS)
+    """Names of the mixtures shipped in ``configs/data`` (for help strings)."""
+    return sorted(p.stem for p in MIXTURE_DIR.glob("*.json"))
 
 
 def preset_sources(name: str) -> list[DataSourceSpec]:
-    """Return a fresh copy of the named preset's source list."""
-    if name not in _PRESETS:
-        raise KeyError(f"unknown data preset {name!r}; choose from {preset_names()}")
-    return [replace(s) for s in _PRESETS[name]]
+    """Load a mixture by name (``configs/data/<name>.json``) or by path.
+
+    JSON shape: ``{"sources": [{"dataset": ..., "weight": ..., "format": ...}, ...]}``.
+    ``dataset`` is the HuggingFace hub id and ``config`` its subset name; every other
+    key mirrors a ``DataSourceSpec`` field and is optional. Adding a dataset is a new
+    JSON file, never an edit to this module.
+
+    For a one-off plain-text source, prefer ``--data-source NAME[:CONFIG[:KEY[:WEIGHT]]]``
+    (repeatable) over writing a JSON — only chat/template formats need a mixture file.
+    """
+    path = _mixture_path(name)
+    if not path.is_file():
+        raise KeyError(f"unknown data mixture {name!r} ({path}); have {preset_names()}")
+    out = []
+    for src in json.loads(path.read_text())["sources"]:
+        src = dict(src)
+        out.append(DataSourceSpec(
+            dataset_name=src.pop("dataset"),
+            dataset_config=src.pop("config", None),
+            **src,
+        ))
+    return out
 
 
 def parse_source_spec(spec: str) -> DataSourceSpec:
     """Parse a CLI ``NAME[:CONFIG[:TEXT_KEY[:WEIGHT]]]`` source string.
 
     Empty CONFIG / TEXT_KEY fields fall back to defaults (None / "text"), so
-    ``name::code:0.2`` sets text_key + weight while leaving config unset.
+    ``name::code:0.2`` sets text_key + weight while leaving config unset. Plain-text
+    sources only — chat/template formats need a mixture JSON.
     """
     parts = spec.split(":")
     if not parts[0]:
@@ -102,7 +250,7 @@ def parse_source_spec(spec: str) -> DataSourceSpec:
 @dataclass
 class CalibrationDataConfig:
     sources: list[DataSourceSpec] = field(
-        default_factory=lambda: preset_sources(DEFAULT_PRESET)
+        default_factory=lambda: preset_sources(DEFAULT_MIXTURE)
     )
     seq_len: int = 4096
     # Fixed interleave seed: the loader is consumed with num_workers=0 and NO
@@ -164,7 +312,7 @@ class PackedTokenStream(IterableDataset):
 
     ``_streams`` is a test seam: pre-built (already "text"-keyed) iterables to use
     instead of ``load_dataset``, so the packing / interleave logic can be exercised
-    without network.
+    without network. They must be re-iterable — the length probe walks them first.
     """
 
     def __init__(self, tokenizer, cfg: CalibrationDataConfig, *, _streams: list | None = None):
@@ -174,22 +322,21 @@ class PackedTokenStream(IterableDataset):
 
         if _streams is not None:
             streams = list(_streams)
-            weights = [s.weight for s in cfg.sources] if cfg.sources else [1.0] * len(streams)
+            sources = cfg.sources
         else:
-            from datasets import load_dataset  # local: avoid hard dep at module load
+            sources = cfg.sources
+            streams = [_load_rendered(s, tokenizer) for s in sources]
 
-            streams, weights = [], []
-            for s in cfg.sources:
-                ds = load_dataset(
-                    s.dataset_name, s.dataset_config, split=s.split, streaming=True,
-                )
-                # Normalize every source to a single "text" column so they share a
-                # feature schema (required by interleave_datasets).
-                if s.text_key != "text":
-                    ds = ds.rename_column(s.text_key, "text")
-                ds = ds.select_columns(["text"])
-                streams.append(ds)
-                weights.append(s.weight)
+        # Price each source in tokens before interleaving. Skipped for a single
+        # source, where the weight is unused anyway.
+        if len(streams) > 1:
+            lengths = []
+            for s, ds in zip(sources, streams):
+                lengths.append(mean_doc_tokens(s, tokenizer, stream=ds))
+            weights = token_weights(sources, lengths)
+            _log_mixture(sources, lengths, weights)
+        else:
+            weights = [1.0] * len(streams)
 
         self.ds = _interleave(streams, weights, cfg.seed)
 

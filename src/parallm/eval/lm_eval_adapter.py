@@ -330,6 +330,7 @@ def run_lm_eval(
     seed: int = 0,
     log_samples: bool = True,
     quiet: bool = False,
+    include_path: "str | None" = None,
 ) -> "dict | None":
     """One lm-eval pass over ``forward_fn``. Every rank must call this.
 
@@ -337,11 +338,18 @@ def run_lm_eval(
     request stream in an identical order — that is what keeps the cross-track
     ``SyncBoundary`` collectives inside the forward in lockstep.
 
+    ``include_path`` is a directory of extra lm-eval task YAMLs (this repo ships
+    ``configs/eval_tasks``, see ``downstream.EVAL_TASK_PATH``), registered
+    alongside the built-in registry. That is how a task over an arbitrary
+    HuggingFace hub dataset is added without a code change: drop a YAML in that
+    directory and name it in ``tasks``.
+
     Returns ``simple_evaluate``'s dict on global rank 0 and ``None`` on every
     other rank (lm-eval gates the return on ``LOCAL_RANK == 0``), so callers
     that act on the score collectively must broadcast it.
     """
     from lm_eval import simple_evaluate  # deferred: heavy import
+    from lm_eval.tasks import TaskManager
 
     lm = PTLM(
         forward_fn=forward_fn,
@@ -355,6 +363,7 @@ def run_lm_eval(
         return simple_evaluate(
             model=lm,
             tasks=tasks,
+            task_manager=TaskManager(include_path=include_path) if include_path else None,
             num_fewshot=num_fewshot,
             limit=limit,
             batch_size=batch_size,

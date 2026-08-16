@@ -1,0 +1,39 @@
+{
+  "sources": [
+    {
+      "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+      "config": "math",
+      "weight": 0.3,
+      "format": "chat",
+      "field": "messages"
+    },
+    {
+      "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+      "config": "science",
+      "weight": 0.15,
+      "format": "chat",
+      "field": "messages"
+    },
+    {
+      "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+      "config": "swe",
+      "weight": 0.2,
+      "format": "chat",
+      "field": "messages"
+    },
+    {
+      "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+      "config": "chat",
+      "weight": 0.2,
+      "format": "chat",
+      "field": "messages"
+    },
+    {
+      "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
+      "config": "instruction_following",
+      "weight": 0.15,
+      "format": "chat",
+      "field": "messages"
+    }
+  ]
+}

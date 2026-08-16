@@ -40,7 +40,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
-from parallm.eval.downstream import macro_score
+from parallm.eval.downstream import DEFAULT_TASKS, EVAL_TASK_PATH, MissingTasks, macro_metrics
 from parallm.eval.lm_eval_adapter import (
     is_lm_head_owner,
     make_student_forward_fn,
@@ -80,6 +80,7 @@ def _run_one_target(
         max_length=args.max_length,
         num_fewshot=args.num_fewshot,
         seed=args.seed,
+        include_path=args.eval_task_path,
     )
 
 
@@ -109,14 +110,24 @@ def main() -> int:
     p.add_argument("--checkpoint-dir", required=True,
                    help="Per-rank checkpoint dir with track_*.safetensors and manifest.json. "
                         "In 'teacher' mode only the manifest is read (for n_tracks / sync layout).")
-    p.add_argument("--tasks", default="hellaswag,arc_easy,arc_challenge,winogrande,piqa",
-                   help="Comma-separated lm-eval task names. MMLU is opt-in via --include-mmlu (slow).")
+    p.add_argument("--tasks", default=DEFAULT_TASKS,
+                   help="Comma-separated lm-eval task names — built-ins, or any YAML in "
+                        "--eval-task-path. The default four are the macro convention. For the "
+                        "unbiased math number use `--tasks mmlu_pro_math_mc --limit 0`: the "
+                        "limit-200 prefix of that task reads high. MMLU is opt-in via "
+                        "--include-mmlu (slow).")
+    p.add_argument("--eval-task-path", default=EVAL_TASK_PATH,
+                   help="Directory of extra lm-eval task YAMLs (default: the repo's "
+                        "configs/eval_tasks). Must match the trainer's --eval-task-path, or a "
+                        "rescore here and the in-loop macro stop meaning the same thing.")
     p.add_argument("--include-mmlu", action="store_true",
                    help="Append `mmlu` to --tasks. Adds ~hours of GPU time on a single node.")
     p.add_argument("--num-fewshot", type=int, default=None,
                    help="Override fewshot count for all tasks. Default = each task's standard shot count.")
-    p.add_argument("--limit", type=int, default=None,
-                   help="Cap requests per task. Useful for smoke testing (e.g. --limit 32).")
+    p.add_argument("--limit", type=int, default=200,
+                   help="Cap requests per task; 0 scores the full sets. Defaults to the "
+                        "trainer's 200 so a rescore here is comparable to the in-loop macro "
+                        "(noise ~±0.015). Lower it for smokes.")
     p.add_argument("--batch-size", type=int, default=8,
                    help="Requests scored per forward. Each forward pays a fixed set of NCCL "
                         "all-reduces (embed + one per sync boundary) regardless of batch size, "
@@ -124,14 +135,17 @@ def main() -> int:
                         "The owner rank holds a (B, max_len, vocab) bf16 logits tensor, so lower "
                         "this for long-context / loglikelihood-rolling tasks (e.g. wikitext) to "
                         "avoid OOM; the short-context multiple-choice tasks are fine at 8+.")
-    p.add_argument("--max-length", type=int, default=4096,
-                   help="Tokenizer truncation length for lm-eval contexts.")
+    p.add_argument("--max-length", type=int, default=2048,
+                   help="Tokenizer truncation length for lm-eval contexts. Matches the "
+                        "trainer's --eval-max-length: a longer cap here would fit fewshot "
+                        "prompts the in-loop macro truncated, and the two numbers would diverge.")
     p.add_argument("--output-json", default=None,
                    help="Optional path to dump per-target lm-eval results dict (rank 0 only). "
                         "In 'both' mode the file contains a top-level {student, teacher} dict.")
-    p.add_argument("--seed", type=int, default=0,
+    p.add_argument("--seed", type=int, default=42,
                    help="lm-eval random/numpy/torch seed. Identical on every rank so request "
-                        "ordering and fewshot sampling line up across ranks.")
+                        "ordering and fewshot sampling line up across ranks. Matches the "
+                        "trainer's --seed so both draw the same limited subset of each task.")
     p.add_argument("--sync-indices", default=None,
                    help="Override the manifest sync schedule (comma-separated layer indices). "
                         "Required when the checkpoint is a raw convert output, which carries no "
@@ -267,7 +281,8 @@ def main() -> int:
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     if args.include_mmlu and "mmlu" not in tasks:
         tasks.append("mmlu")
-    _log(rank, f"[init] tasks={tasks}")
+    args.limit = args.limit or None  # 0 means "no cap", which lm-eval spells None
+    _log(rank, f"[init] tasks={tasks} limit={args.limit}")
 
     all_results: dict[str, dict] = {}
     if want_student:
@@ -298,7 +313,14 @@ def main() -> int:
         for tgt, results in all_results.items():
             print(f"===== lm-evaluation-harness ({tgt}) =====")
             print(_format_results(results))
-            print(f"  macro={macro_score(results):.4f}")
+            try:
+                m = macro_metrics(results, tasks)
+                print(f"  macro={sum(m.values()) / len(m):.4f}")
+            except MissingTasks as e:
+                # Printed, never silently averaged over the survivors: the tasks
+                # span ~0.4 in accuracy, so a partial macro is not a smaller macro,
+                # it is a different (usually higher) number.
+                print(f"  macro=INCOMPLETE — {e}")
             print()
         if args.output_json:
             Path(args.output_json).write_text(

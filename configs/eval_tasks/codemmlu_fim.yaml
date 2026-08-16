@@ -1,0 +1,18 @@
+# CodeMMLU's fill-in-the-middle split: pick the line that fills a hole. 2129 test
+# docs, 4 options, MIT-licensed and ungated parquet.
+#
+# num_fewshot is pinned to 0 HERE, and a YAML-level num_fewshot cannot be overridden
+# by --num-fewshot on the command line. The shots would be whole code files.
+task: codemmlu_fim
+dataset_path: Fsoft-AIC/CodeMMLU
+dataset_name: fill_in_the_middle
+test_split: test
+output_type: multiple_choice
+doc_to_text: !function utils.codemmlu_doc_to_text
+doc_to_choice: !function utils.letter_choices
+doc_to_target: !function utils.letter_target
+num_fewshot: 0
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true

@@ -91,10 +91,24 @@ python scripts/build_replicas.py --tracks-dir ./pt_tracks --hf-model <checkpoint
 torchrun --standalone --nproc-per-node=8 scripts/eval_fidelity.py \
     --hf-model <teacher> --checkpoint-dir ./pt_tracks --num-batches 200
 
-# downstream retention (the metric that matters — proxies hid failures before)
+# downstream retention (the metric that matters — proxies hid failures before).
+# --tasks defaults to the 4-task macro: arc_easy, arc_challenge, mmlu_pro_math_mc,
+# codemmlu_fim. Name any lm-eval built-in, or any YAML in configs/eval_tasks.
 torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
-    --hf-model <teacher> --checkpoint-dir ./pt_tracks --tasks arc_challenge,winogrande,piqa
+    --hf-model <teacher> --checkpoint-dir ./pt_tracks
+
+# the unbiased math number: the limit-200 prefix of that task reads high
+torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
+    --hf-model <teacher> --checkpoint-dir ./pt_tracks \
+    --tasks mmlu_pro_math_mc --limit 0
 ```
+
+Training data and eval tasks are both chosen at launch, no code change:
+`--data-preset` takes a mixture name under [configs/data](configs/data) or a path to
+any mixture JSON, and `--tasks` / `--eval-tasks` take any registered task name. A
+new dataset is a new JSON; a new benchmark is a new YAML in
+[configs/eval_tasks](configs/eval_tasks). In a mixture, a source's `weight` is its
+share of training **tokens** — the realized token/document split is logged at startup.
 
 ## Layout
 

@@ -49,6 +49,17 @@ def main() -> int:
         StateDictModel(text_sd, tcfg), n_tracks=n, text_config_attr="config",
     )
     save_tracks(args.out_dir, tracks, manifest)
+    # Say how the MLP actually landed. `align_chunk` keeps every track covered, so
+    # this should always read N/N — it is here because the failure is silent
+    # otherwise: zero-padded lanes are exact (silu(0)*up = 0), so a convert whose
+    # MLP spans fewer tracks than N looks perfectly healthy.
+    slab = manifest.per_track_param_shapes.get("layers.0.mlp.gate_proj.weight")
+    if slab:
+        inter = int(getattr(tcfg, "intermediate_size", 0))
+        covered = min(n, -(-inter // slab[0])) if inter else n
+        note = "" if covered == n else f"  ⚠ {n - covered} track(s) hold NO MLP"
+        print(f"[info] MLP slab {slab[0]} x {n} tracks covers {inter} lanes "
+              f"({covered}/{n} tracks carry MLP){note}")
     print(f"[ok] wrote {len(tracks)} track shards + manifest to {args.out_dir}")
     return 0
 

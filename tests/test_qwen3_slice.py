@@ -567,6 +567,41 @@ def test_distill_step_batched_merged_matches_looped_unfused():
                if p.grad is not None and p.grad.abs().sum() > 0) > 0
 
 
+def test_eager_for_eval_releases_both_registries(monkeypatch):
+    """An eval pass must un-compile the BATCHED fold too, not just the seam.
+
+    The compiled units are built with ``dynamic=False``, so each distinct shape is
+    its own dynamo cache entry. An lm-eval pass arrives with a different batch size
+    and a fresh sequence length per batch, so leaving the fold compiled burns through
+    ``recompile_limit`` (8) inside the FIRST eval — and once that limit is hit dynamo
+    runs the code object EAGER for the rest of the process. A single missed registry
+    therefore disables ``--compile`` for the whole remainder of training, which is
+    invisible in the loss and shows up only as a step time nobody re-measures.
+    Observed at 32B/N=64: 12 clean training steps, then all 16 warnings (2 halves x
+    8 ranks) during the first eval.
+
+    Same failure shape as `enable_seam_compile` reaching only the seam, which is why
+    both directions are pinned.
+    """
+    from parallm.model import batched, seam
+
+    monkeypatch.setattr(seam, "_COMPILED", {"mixer": object(), "mlp": object()})
+    monkeypatch.setattr(batched, "_COMPILED", {"mixer": object(), "mlp": object()})
+    before = (dict(seam._COMPILED), dict(batched._COMPILED))
+
+    with seam.eager_for_eval():
+        assert not seam._COMPILED, "seam still compiled during eval"
+        assert not batched._COMPILED, "BATCHED FOLD still compiled during eval"
+        # Both resolvers must hand back the eager functions while inside.
+        assert seam._mixer_fn() is seam.seam_token_mixer
+        assert batched._attn_fn() is batched._fold_attn
+        assert batched._mlp_fn() is batched._fold_mlp
+
+    # ...and the training graphs come back, or every eval would pay a recompile.
+    assert seam._COMPILED == before[0]
+    assert batched._COMPILED == before[1]
+
+
 def test_compile_reaches_the_batched_fold_with_one_graph_per_layer_half(monkeypatch):
     """``--compile`` must compile the batched fold ONCE per half, not once per layer.
 

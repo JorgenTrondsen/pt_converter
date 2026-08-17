@@ -301,6 +301,7 @@ class PTWrappedModel(nn.Module):
         return_hidden_pre_lm_head: bool = False,
         capture_post_attn: "set[int] | None" = None,
         capture_post_mlp: "set[int] | None" = None,
+        probe_capture: "dict | None" = None,
     ):
         # 1. Embed (owner-only) + cross-track broadcast via the all-reduce in `embed`.
         h = self.embed(input_ids)
@@ -334,6 +335,7 @@ class PTWrappedModel(nn.Module):
                 exact=self.sync_phase == "exact",
                 capture_post_attn=capture_post_attn,
                 capture_post_mlp=capture_post_mlp,
+                probe_capture=probe_capture,
             )
         else:
             if (self.sync_module.fuse_size > 1 or self.exec_groups > 1
@@ -392,6 +394,7 @@ class PTWrappedModel(nn.Module):
         exact: bool = False,
         capture_post_attn: "set[int] | None" = None,
         capture_post_mlp: "set[int] | None" = None,
+        probe_capture: "dict | None" = None,
     ) -> torch.Tensor:
         """Phase-shifted sync walk — lever B (``exact=False``) and the exact
         schedule (``exact=True``).
@@ -413,6 +416,14 @@ class PTWrappedModel(nn.Module):
         (resp. post-MLP) synced state is stored into ``sync_hiddens`` — the
         teacher-target contract (a boundary target is post-attn, a final /
         mid-window target is post-MLP; a layer never needs both).
+
+        ``probe_capture``: a SEPARATE ``{(layer, phase): hidden}`` dict for the
+        activation probe, which needs BOTH phases at EVERY layer. It cannot share
+        ``sync_hiddens``: that one is keyed by layer alone, so under ``exact`` the
+        post-MLP write silently overwrites the post-attn one at the same depth.
+        Only the ``exact`` walk populates both keys per layer (it is the only
+        schedule that computes both); ``(-1, "mlp")`` holds the embedding, so
+        layer 0 has a pre-state to difference against.
         """
         from parallm.model.seam import checkpointed_halves
 
@@ -429,8 +440,10 @@ class PTWrappedModel(nn.Module):
             return self._run_batched_stack(
                 h, position_embeddings, text_position_ids, layer_masks,
                 L, last, sync_attn_set, sync_hiddens,
-                tap_attn, tap_mlp, exact,
+                tap_attn, tap_mlp, exact, probe_capture,
             )
+        if probe_capture is not None:
+            probe_capture[(-1, "mlp")] = h
         run_mixer, run_mlp = checkpointed_halves(
             self.use_checkpoint and torch.is_grad_enabled(),
             position_embeddings,
@@ -459,6 +472,8 @@ class PTWrappedModel(nn.Module):
                 R = self.sync_module(self.sync_module.leaders(h_attn), block_start)
                 if i in tap_attn:
                     sync_hiddens[i] = R
+                if probe_capture is not None:
+                    probe_capture[(i, "attn")] = R
                 block_start = R
                 pre = [R] * len(self.text_models)
                 new_h = self.sync_module.fuse(
@@ -469,6 +484,8 @@ class PTWrappedModel(nn.Module):
                     Hm = self.sync_module(self.sync_module.leaders(new_h), R)
                     if i in tap_mlp:
                         sync_hiddens[i] = Hm
+                    if probe_capture is not None:
+                        probe_capture[(i, "mlp")] = Hm
                     if i == last:
                         h = Hm
                     block_start = Hm
@@ -485,6 +502,8 @@ class PTWrappedModel(nn.Module):
                     h = self.sync_module(self.sync_module.leaders(new_h), block_start)
                     if i in tap_mlp:
                         sync_hiddens[i] = h
+                    if probe_capture is not None:
+                        probe_capture[(i, "mlp")] = h
                 else:
                     per_track_h = new_h
             if self.layer_stream is not None:
@@ -494,7 +513,7 @@ class PTWrappedModel(nn.Module):
     def _run_batched_stack(
         self, h, position_embeddings, text_position_ids, layer_masks,
         L, last, sync_attn_set, sync_hiddens,
-        tap_attn, tap_mlp, exact,
+        tap_attn, tap_mlp, exact, probe_capture=None,
     ) -> torch.Tensor:
         """`_run_post_attn_stack` for a merged track run as G members.
 
@@ -515,6 +534,8 @@ class PTWrappedModel(nn.Module):
         )
         block_start = h
         carry = h
+        if probe_capture is not None:
+            probe_capture[(-1, "mlp")] = h
         for i in range(L):
             layer_mask = layer_masks[self.text_models[0].config.layer_types[i]]
             if self.layer_stream is not None:
@@ -524,12 +545,16 @@ class PTWrappedModel(nn.Module):
                 R = self.sync_module(h_attn, block_start, stacked=True)
                 if i in tap_attn:
                     sync_hiddens[i] = R
+                if probe_capture is not None:
+                    probe_capture[(i, "attn")] = R
                 block_start = R
                 new_h = run_mlp(i, R)
                 if exact:
                     Hm = self.sync_module(new_h, R, stacked=True)
                     if i in tap_mlp:
                         sync_hiddens[i] = Hm
+                    if probe_capture is not None:
+                        probe_capture[(i, "mlp")] = Hm
                     if i == last:
                         h = Hm
                     block_start = Hm
@@ -542,6 +567,8 @@ class PTWrappedModel(nn.Module):
                     h = self.sync_module(new_h, block_start, stacked=True)
                     if i in tap_mlp:
                         sync_hiddens[i] = h
+                    if probe_capture is not None:
+                        probe_capture[(i, "mlp")] = h
                 else:
                     carry = new_h
             if self.layer_stream is not None:

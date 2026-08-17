@@ -46,7 +46,12 @@ from torch import nn
 from parallm.model.pt_model import PTWrappedModel
 from parallm.model.seam import checkpointed_halves
 from parallm.train.losses import block_mse, block_split
+from parallm.train.probe import ActivationProbe
 from parallm.train.profile import PhaseTimer
+
+# Which pre-norm a sublayer phase reads. Used only by the activation probe, which
+# recomputes the normed input outside the compiled seam halves.
+_NORM_ATTR = {"attn": "input_layernorm", "mlp": "post_attention_layernorm"}
 
 
 @dataclass
@@ -96,10 +101,18 @@ def teacher_forward(
     attention_mask: torch.Tensor | None,
     post_attn_layers: set[int],
     post_mlp_layers: set[int],
+    probe_capture: dict | None = None,
 ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
     """The post-norm final hidden (identical on every rank) and ``{layer: target}``
     captures: post-attn residual at ``post_attn_layers``, post-MLP hidden at
-    ``post_mlp_layers`` — the lever-B target contract."""
+    ``post_mlp_layers`` — the lever-B target contract.
+
+    ``probe_capture`` additionally retains BOTH phases at EVERY layer for the
+    activation probe. The exact-schedule teacher already computes them, so this
+    only holds references — at the cost of 2L resident ``(B, T, H)`` tensors
+    instead of the handful the target contract needs, which is why it is passed
+    only on probe steps.
+    """
     return teacher(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -107,6 +120,7 @@ def teacher_forward(
         return_hidden_pre_lm_head=True,
         capture_post_attn=post_attn_layers,
         capture_post_mlp=post_mlp_layers,
+        probe_capture=probe_capture,
     )
 
 
@@ -218,6 +232,7 @@ def distill_step(
     cfg: DistillConfig,
     loss_scale: float = 1.0,
     prof: "PhaseTimer | None" = None,
+    probe: "ActivationProbe | None" = None,
 ) -> dict[str, torch.Tensor]:
     """One heal step (backward done internally; caller syncs grads + steps).
 
@@ -231,6 +246,11 @@ def distill_step(
     sf=1.0 divergent — a student trained with ZERO exposure to its own outputs
     scores the same evaluated FREE-RUNNING as one trained half on them, so
     exposure bias does not bind along the depth axis here.
+
+    ``probe``: an `ActivationProbe` to score this step's per-layer / per-track
+    activations against the teacher (see `train/probe.py`). Pass it only on probe
+    steps, and only from a RANK-UNIFORM gate — it issues collectives. It adds no
+    sublayer compute: every tensor it reads is already a local of the TF loop.
     """
     prof = prof if prof is not None else PhaseTimer()  # disabled null object
     input_ids = batch["input_ids"]
@@ -255,6 +275,7 @@ def distill_step(
         _, t_caps = teacher_forward(
             teacher, input_ids, attention_mask,
             post_attn_layers=sync_attn_set, post_mlp_layers=post_mlp_set,
+            probe_capture=probe.begin(attention_mask) if probe is not None else None,
         )
     # ----- Scaffolding (embed broadcast + masks + rotary, shared by the loop) -----
     prof_scaffold = prof.phase("scaffold")
@@ -325,6 +346,13 @@ def distill_step(
             student.shadow, use_ckpt, position_embeddings, text_position_ids)
         def sync(xs, pre): return student.sync_module(xs, pre, stacked=True)
         def share(t): return t
+        def norm_in(i, xs, phase):
+            # OUTSIDE the compiled fold on purpose: `_fold_attn`/`_fold_mlp` are what
+            # --compile captures, and a tap inside them is a graph break. The shadow's
+            # skeleton carries the REAL norm modules (batched.MergedShadow.__init__
+            # assigns them off the merged layer), so this reproduces exactly what the
+            # fold normalizes, for one extra RMSNorm.
+            return getattr(student.shadow.grid[0][i], _NORM_ATTR[phase])(xs)
     else:
         run_mixer, run_mlp = checkpointed_halves(
             use_ckpt, position_embeddings, text_position_ids)
@@ -337,8 +365,13 @@ def distill_step(
                 [run_mlp(student.text_models[k].layers[i], xs[k]) for k in range(K)], xs)
         def sync(xs, pre): return student.sync_module(student.sync_module.leaders(xs), pre)
         def share(t): return [t] * K
+        def norm_in(i, xs, phase):
+            return [getattr(student.text_models[k].layers[i], _NORM_ATTR[phase])(xs[k])
+                    for k in range(K)]
 
     block_input = share(inputs_embeds.detach())
+    if probe is not None:
+        probe.bind(sync, norm_in)
 
     prof_block = prof.phase("tf_block_loop")
     prof_block.__enter__()
@@ -354,6 +387,17 @@ def distill_step(
             # Final layer: post-MLP carried sync. Non-boundary: loss-only tap
             # (synced reconstruction; the forward keeps carrying the partial).
             h_synced = sync(new_h, block_start) if supervise else None
+        if probe is not None:
+            # Scored BEFORE `_flush` backwards this segment's graph. The mixer's
+            # per-track pre-state is `block_input`, which at a boundary is the
+            # PREVIOUS layer's own-carried post-MLP — that partial input is the
+            # d1b seam, and it is what makes the post-attn row the interesting one.
+            probe.record(i, "attn", h_attn, block_input,
+                         merged=h_synced if is_boundary else None,
+                         pre_shared=block_start)
+            if not is_boundary:
+                probe.record(i, "mlp", new_h, h_attn,
+                             merged=h_synced, pre_shared=block_start)
         if supervise:
             t_l = t_caps.pop(i).detach()
             r = tap_loss(h_synced, t_l)
@@ -367,6 +411,12 @@ def distill_step(
             seg_count = 0
             block_start = t_l  # teacher-forced carry (see the sf note above)
             block_input = mlp(i, share(t_l))
+            if probe is not None:
+                # Every track's MLP reads the SAME teacher-exact residual here, so
+                # this row's only student-side error is the MLP weights themselves —
+                # at step 0 the merged state must reproduce the teacher's post-MLP,
+                # which is the probe's alignment rail.
+                probe.record(i, "mlp", block_input, share(t_l))
         elif i == last:
             _flush(seg_loss, seg_count)
         else:

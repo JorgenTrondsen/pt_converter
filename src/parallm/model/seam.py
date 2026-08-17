@@ -9,6 +9,8 @@ split itself was rail-validated there; the estimator machinery was not).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 
 
@@ -96,6 +98,41 @@ def enable_seam_compile(
     from parallm.model.batched import enable_batched_compile
 
     enable_batched_compile(mode, dynamic=dynamic, inductor_mode=inductor_mode)
+
+
+@contextmanager
+def eager_for_eval():
+    """Run BOTH track representations eager for the duration of an eval pass.
+
+    Clearing the registries is enough — each walk resolves its compiled callable per
+    `checkpointed_halves` / `batched_halves` call — and the training graphs survive,
+    because `torch.compile` caches on the function object, which is handed straight
+    back afterwards.
+
+    ⚠ **This must cover the batched fold, not just the seam.** The compiled units are
+    built with ``dynamic=False``, so every distinct shape is its own dynamo cache
+    entry; an lm-eval pass arrives with a different batch size and a fresh sequence
+    length per batch, and burns through ``recompile_limit`` (8) within the FIRST eval.
+    Once that limit is hit dynamo marks the code object and runs it EAGER for the rest
+    of the process — so a single missed registry silently disables ``--compile`` for
+    the whole remainder of training, not just for the eval. Measured at 32B/N=64: 12
+    training steps ran clean, and all 16 warnings (2 fold halves x 8 ranks) fired
+    during the first eval.
+
+    Pairs with `enable_seam_compile`, which likewise has to reach both registries —
+    the same registry going missing there is the bug that made ``--compile`` a silent
+    no-op on every ``supports_batched_exec`` family.
+    """
+    from parallm.model import batched
+
+    saved = (dict(_COMPILED), dict(batched._COMPILED))
+    _COMPILED.clear()
+    batched._COMPILED.clear()
+    try:
+        yield
+    finally:
+        _COMPILED.update(saved[0])
+        batched._COMPILED.update(saved[1])
 
 
 def _mixer_fn():

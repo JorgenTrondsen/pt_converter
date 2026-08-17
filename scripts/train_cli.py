@@ -40,6 +40,7 @@ from parallm.dist.groups import build_groups
 from parallm.eval.downstream import DEFAULT_TASKS, EVAL_TASK_PATH
 from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
+from parallm.train.probe import ActivationProbe, summary_lines
 from parallm.train.profile import PhaseTimer
 from parallm.train.data import (
     DEFAULT_MIXTURE,
@@ -69,21 +70,17 @@ def _log(rank: int, msg: str) -> None:
 
 @contextmanager
 def _eval_compile_guard():
-    """Force the seam back to eager for the duration of an lm-eval pass.
+    """Force BOTH track representations back to eager for an lm-eval pass.
 
-    `parallm.model.seam` resolves the compiled callables per `checkpointed_halves`
-    call, so swapping the registry out and back is enough — no re-compilation, and
-    the training graphs survive because `torch.compile` caches on the function
-    object, which we hand straight back.
+    Delegates to `seam.eager_for_eval`, which owns the pairing — this used to clear
+    only `seam._COMPILED`, leaving the batched fold compiled, and an eval's shapes
+    then exhausted dynamo's `recompile_limit` and dropped the fold to eager for the
+    REST of training.
     """
-    from parallm.model import seam
+    from parallm.model.seam import eager_for_eval
 
-    saved = dict(seam._COMPILED)
-    seam._COMPILED.clear()
-    try:
+    with eager_for_eval():
         yield
-    finally:
-        seam._COMPILED.update(saved)
 
 
 class _KernelWindow:
@@ -476,6 +473,19 @@ def main() -> int:
                         "([taps]) and distance from the warm start ([dist]). The "
                         "latter snapshots theta_0 (~+7GB/rank at 27B/N=24), hence "
                         "opt-in. Emitted on --log-every steps only.")
+    p.add_argument("--probe-steps", default="",
+                   help="Comma list of steps at which to run the per-layer/per-track "
+                        "activation probe (e.g. '0,50,250,500'); empty = off. Scores "
+                        "every layer's post-attn AND post-mlp state, delta and normed "
+                        "sublayer input against the exact-schedule teacher, per track. "
+                        "Step 0 is the untrained-convert baseline and carries the "
+                        "alignment rail, so include it. Costs ~2L extra resident "
+                        "(B,T,H) teacher tensors and ~2 collectives/layer ON THOSE "
+                        "STEPS ONLY.")
+    p.add_argument("--probe-dir", default=None,
+                   help="Where --probe-steps writes rank{r}.jsonl (default "
+                        "<out-dir>/probe). Keep it OFF '/' — that filesystem is a "
+                        "9766M user quota.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -763,6 +773,37 @@ def main() -> int:
     t0 = time.perf_counter()
     train_iter = iter(train_loader)
 
+    probe_steps = {int(s) for s in args.probe_steps.split(",") if s.strip()}
+    probe = None
+    probe_batch = None
+    if probe_steps:
+        # One fixed batch for every probe step, so only the MODEL differs between
+        # them; held out so a visit can't flatter a batch the model has fitted.
+        # ⚠ Costs the stream its first batch — compare probed runs against probed.
+        probe_batch = {k: v.to(torch.cuda.current_device())
+                       for k, v in next(train_iter).items()}
+        # A "stream" is one independent residual the walk drives: a batched fold
+        # runs the merged track as `exec_groups` of them, the looped path runs one
+        # per logical track. Numbering them globally (rank-major, contiguous — the
+        # assignment `dist.groups.compute_contiguous_assignment` makes) is what lets
+        # the per-rank JSONL files be concatenated without a gather.
+        n_streams = exec_groups if exec_groups > 1 else len(layout.local_track_ids)
+        shards_per_stream = manifest.n_tracks // (layout.world_size * n_streams)
+        probe = ActivationProbe(
+            num_layers=num_layers,
+            n_streams=n_streams,
+            stream_offset=(layout.local_track_ids[0] * merge_group) // shards_per_stream,
+            shards_per_stream=shards_per_stream,
+            rank=rank,
+            out_dir=args.probe_dir or (out_dir / "probe"),
+            device=torch.cuda.current_device(),
+            teacher_layers=teacher.text_models[0].layers,
+        )
+        _log(rank, f"[init] activation probe at steps {sorted(probe_steps)} -> "
+                   f"{args.probe_dir or (out_dir / 'probe')} "
+                   f"({n_streams} streams/rank x {shards_per_stream} shards, "
+                   f"fixed held-out batch)")
+
     def run_eval(tag: str) -> float:
         """The lm-evaluation-harness downstream macro on the live student.
 
@@ -836,6 +877,16 @@ def main() -> int:
             batch = {k: v.to(torch.cuda.current_device()) for k, v in batch.items()}
         cur_lr[0] = lr_at(step)  # the in-backward hooks read this as they fire
         gsq.zero_()
+        # Rank-uniform gate — an asymmetric probe desyncs the next collective. Zeroing
+        # both lambdas skips every backward and the CE half, reusing the training walk.
+        if probe is not None and step in probe_steps:
+            probe.step = step
+            with torch.no_grad(), prof.phase("probe"):
+                distill_step(student, teacher, lm_head, probe_batch,
+                             replace(dcfg, lambda_block=0.0, lambda_ce=0.0),
+                             probe=probe)
+            for line in summary_lines(probe.flush(), step):
+                _log(rank, line)
         losses = distill_step(
             student, teacher, lm_head, batch, dcfg,
             loss_scale=1.0 / args.grad_accum_steps,

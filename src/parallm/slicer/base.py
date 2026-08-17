@@ -39,8 +39,31 @@ class SlicerSpec(Protocol):
     def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]: ...
 
 
-def align_chunk(chunk: int, align: int | None = None) -> int:
+def align_chunk(
+    chunk: int,
+    align: int | None = None,
+    *,
+    full_size: int | None = None,
+    n_tracks: int | None = None,
+) -> int:
     """Round a zero-padded per-track slab up to a friendlier multiple.
+
+    ``full_size`` / ``n_tracks``: never round so far that trailing tracks fall
+    entirely past the split dim and hold nothing but zeros. **Every track gets a
+    slab** — the model is split as evenly as it can be across n_tracks, because that
+    is what max-tracks means; a track holding only an attention head is not a whole
+    track. Ignored under an explicit ``align``, where a kernel requirement wins.
+
+    Qwen3-32B at N=64 is the case: 25600 divides by 64 EXACTLY (400 each), yet the
+    rounding widens the slab to 448 and 25600/448 = 57.14 — 57 tracks get full slabs,
+    track 57 gets the last 64 lanes, and tracks 58-63 begin past the end and are pure
+    padding. The tax grows with N (1 dead track at N=32, 6 at N=64), i.e. it bites
+    hardest exactly where max-tracks wants to go.
+
+    ⚠ The even slab is measurably WORSE downstream — trained n=2/arm at 32B/N=64:
+    −0.031 macro and −0.098 math vs the 448 slab, plus ~5.5% on the MLP bmm. That is
+    an accepted cost, not an oversight: an even split is the architecture we want. Do
+    not "fix" it back by reading those numbers; see the ledger.
 
     ``align=None`` (the default) is the THROUGHPUT alignment: round to 64. Measured
     on the 27B (bf16, M=2048, K=5120): a **726**-wide GEMM — `ceil(17408/24)` — runs
@@ -61,7 +84,14 @@ def align_chunk(chunk: int, align: int | None = None) -> int:
     if align is not None:
         return -(-chunk // align) * align
     up = -(-chunk // 64) * 64
-    return up if up * 8 <= chunk * 9 else chunk
+    if up * 8 > chunk * 9:
+        return chunk
+    if (full_size is not None and n_tracks is not None
+            and -(-full_size // up) < n_tracks):
+        # Rounding up would need fewer slabs than there are tracks, so the
+        # trailing ones would sit entirely past `full_size` and hold only zeros.
+        return chunk
+    return up
 
 
 def _even_chunk(
@@ -77,7 +107,7 @@ def _even_chunk(
         return size // n_tracks
     if size != pad_full_size:
         raise ValueError(f"{label}: expected dim size {pad_full_size}, got {size}")
-    return align_chunk(-(-size // n_tracks), align)
+    return align_chunk(-(-size // n_tracks), align, full_size=size, n_tracks=n_tracks)
 
 
 def _cat_merge(slices: list[torch.Tensor], dim: int, chunk: int | None = None) -> torch.Tensor:

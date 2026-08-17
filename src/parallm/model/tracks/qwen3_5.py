@@ -27,5 +27,8 @@ def build_per_track_text_config(text_config, n_tracks: int, fuse_size: int = 1):
     # and `align_chunk` makes that padding pay for itself. MUST match the slicer's
     # `_even_chunk` or the shards won't load — including under `fuse_size`, where
     # the merged width is F *aligned* per-track slabs, not one aligned F-wide slab.
-    cfg.intermediate_size = align_chunk(-(-cfg.intermediate_size // n_tracks)) * fuse_size
+    inter = int(cfg.intermediate_size)
+    cfg.intermediate_size = align_chunk(
+        -(-inter // n_tracks), full_size=inter, n_tracks=n_tracks
+    ) * fuse_size
     return cfg

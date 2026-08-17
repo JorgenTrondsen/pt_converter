@@ -181,6 +181,43 @@ def test_align_chunk_rounds_only_when_it_is_nearly_free():
     assert align_chunk(3) == 3        # test-sized: rounding would inflate 21x
 
 
+def test_every_track_gets_a_slab():
+    """A convert slices the split dim as EVENLY as it can across n_tracks: the
+    throughput rounding is given up whenever it would strand a track.
+
+    Qwen3-32B at N=64 is the case. 25600/64 = 400 EXACTLY, yet rounding widens the
+    slab to 448 and 25600/448 = 57.14 — so tracks 58-63 begin past the end of the
+    tensor and hold nothing but zeros. The model stays exact (silu(0)*up = 0); it
+    just spends 6 of its 64 tracks on nothing, and the tax GROWS with N, which is
+    the opposite of what max-tracks wants. A track holding only an attention head
+    is not a whole track.
+
+    ⚠ This is a deliberate quality-for-architecture trade, not an optimization:
+    the even slab measured −0.031 macro / −0.098 math (trained, n=2/arm) against
+    the 448 one. Do not revert it by reading those numbers.
+    """
+    from parallm.slicer.base import align_chunk
+
+    def slab(size, n):
+        return align_chunk(-(-size // n), full_size=size, n_tracks=n)
+
+    def covered(size, n):
+        return min(n, -(-size // slab(size, n)))
+
+    assert slab(25600, 64) == 400 and covered(25600, 64) == 64
+    assert slab(25600, 32) == 800 and covered(25600, 32) == 32
+    # 27B/N=24: 768 would cover only 23 of 24 tracks, so 726 stands — which is also
+    # exactly what the pre-`align_chunk` shards on disk already hold.
+    assert slab(17408, 24) == 726 and covered(17408, 24) == 24
+    # Where rounding strands nobody it is still taken — the throughput win is given
+    # up only when it actually costs a track.
+    assert slab(25600, 16) == 1600                  # already a multiple of 64
+    assert slab(25600, 24) == 1088                  # 24 slabs still cover 25600
+    assert slab(3584, 8) == 448
+    # An explicit `align` is a KERNEL requirement and outranks evenness.
+    assert align_chunk(180, 8, full_size=2880, n_tracks=16) == 184
+
+
 def test_narrow_shards_load_into_the_aligned_model_unchanged():
     """`align_chunk` widened the per-track MLP, so shards converted before it are
     short along one dim. The added lanes are zeros either way, so padding them on
@@ -203,7 +240,7 @@ def test_narrow_shards_load_into_the_aligned_model_unchanged():
     import parallm.slicer.base as slicer_base
 
     real_align = slicer_base.align_chunk
-    slicer_base.align_chunk = lambda chunk, align=64: chunk
+    slicer_base.align_chunk = lambda chunk, align=64, **kw: chunk
     try:
         old_tracks, old_manifest = slice_model_to_tracks(
             dense, n_tracks=N_TRACKS, sync_block_depth=1, text_config_attr="config"

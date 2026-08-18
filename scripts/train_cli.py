@@ -553,8 +553,10 @@ def main() -> int:
     if sync_layers[-1] != num_layers - 1:
         sync_layers.append(num_layers - 1)  # the head needs the final post-MLP sync
 
+    # One post-attn all-reduce per boundary, plus the head's post-MLP sync.
     _log(rank, f"[init] n_tracks={manifest.n_tracks} world={layout.world_size} "
                f"boundaries={len(sync_layers)} phase={args.sync_phase} "
+               f"syncs={len(sync_layers) + 1} "
                f"fuse={args.fuse_tracks} -> {_describe_plan(plan, tracks_per_rank)}")
 
     # Before any per-track config is built — `build_per_track_text_config` reads the

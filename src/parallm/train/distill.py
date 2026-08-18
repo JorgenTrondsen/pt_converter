@@ -64,6 +64,7 @@ class DistillConfig:
     inferior: the arm that did NOT optimize KL reached a LOWER KL (1.135) than
     the arm that did (1.168), because forward-KL and hard-label CE have
     near-parallel gradients and CE is the better-conditioned of the two.
+    Re-tested 2026-08-18 on MATH rather than macro and refuted again.
     ``git log`` has the four-term version if an older recipe must be reproduced.
     """
 
@@ -128,13 +129,16 @@ def capture_sets(
     sync_layer_indices, num_layers: int, intra_window_mse: bool = False
 ) -> tuple[set[int], set[int]]:
     """``(post_attn_layers, post_mlp_layers)`` the teacher captures: post-attn
-    residual at every boundary, post-MLP at the final layer (plus mid-window
-    taps under ``intra_window_mse``)."""
+    residual at every boundary, post-MLP at the final layer when the schedule does
+    not make it one (plus mid-window taps under ``intra_window_mse``).
+
+    ⚠ Never both for one layer: ``sync_hiddens`` is keyed by layer alone, so the
+    post-MLP write would silently overwrite the post-attn target."""
     last = num_layers - 1
-    post_attn = set(sync_layer_indices) - {last}
-    post_mlp = {last} | (
-        set(range(num_layers)) - post_attn - {last} if intra_window_mse else set()
-    )
+    post_attn = set(sync_layer_indices)
+    post_mlp = set() if last in post_attn else {last}
+    if intra_window_mse:
+        post_mlp |= set(range(num_layers)) - post_attn - {last}
     return post_attn, post_mlp
 
 
@@ -263,9 +267,10 @@ def distill_step(
     last = L - 1
     need_ce = cfg.lambda_ce != 0.0
 
-    # Teacher targets: post-attn at boundaries, post-MLP at the final layer and
-    # (with intra-window supervision) the non-boundary layers.
-    sync_attn_set, post_mlp_set = capture_sets(cfg.sync_layer_indices, L, cfg.intra_window_mse)
+    # Teacher targets: post-attn at every boundary (the final layer included), plus
+    # mid-window post-MLP taps under --intra-window-mse.
+    sync_attn_set, post_mlp_set = capture_sets(
+        cfg.sync_layer_indices, L, cfg.intra_window_mse)
     # Only the per-boundary captures are consumed now — CE is against hard
     # labels, so the teacher's final hidden goes unused. Do NOT "clean that up"
     # by flipping teacher_forward's return_hidden_pre_lm_head to False: that

@@ -400,13 +400,19 @@ class PTWrappedModel(nn.Module):
         schedule (``exact=True``).
 
         Lever B: the one fresh all-reduce per sync window lands POST-ATTENTION
-        at every boundary in ``self.sync_after_layers`` except the final layer
-        (that boundary layer's MLP reads the FULL synced residual and its delta
-        is then CARRIED un-summed), the final layer syncs post-MLP for the norm,
+        at every boundary in ``self.sync_after_layers`` (that boundary layer's MLP
+        reads the FULL synced residual and its delta is then CARRIED un-summed),
         and non-boundary layers run fully partial. The all-reduce sums every
         per-track delta accrued since the previous sync, so each delta is summed
-        exactly once; the sync COUNT equals the boundary schedule's. Reduces to
-        the d1b per-layer loop when every layer is a boundary.
+        exactly once. Reduces to the d1b per-layer loop when every layer is a
+        boundary.
+
+        **The FINAL layer is a full boundary — post-attn AND post-MLP** (one extra
+        all-reduce, 64 -> 65 at d1b). Excluding it, as this walk used to, left the
+        last window feeding its MLP a residual missing TWO un-synced sublayers
+        instead of one, in the window that sets the logits: +0.2157 math to repair.
+        A schedule omitting the last layer still works — it falls to the own-carry
+        branch, which syncs post-MLP for the norm.
 
         Exact: sync after attention AND after MLP of every layer — every
         sublayer reads the true residual, so the walk is the dense forward up
@@ -429,9 +435,7 @@ class PTWrappedModel(nn.Module):
 
         L = len(self.text_models[0].layers)
         last = L - 1
-        sync_attn_set = (
-            set(range(L)) if exact else set(self.sync_after_layers) - {last}
-        )
+        sync_attn_set = set(range(L)) if exact else set(self.sync_after_layers)
         if sync_hiddens is None:
             tap_attn = tap_mlp = ()
         else:
@@ -490,6 +494,14 @@ class PTWrappedModel(nn.Module):
                         h = Hm
                     block_start = Hm
                     per_track_h = [Hm for _ in self.text_models]
+                elif i == last:
+                    # The head's post-MLP sync. Pre-state is R, not block_start: this
+                    # MLP's input WAS the synced residual, so its delta is all there is.
+                    h = self.sync_module(self.sync_module.leaders(new_h), R)
+                    if i in tap_mlp:
+                        sync_hiddens[i] = h
+                    if probe_capture is not None:
+                        probe_capture[(i, "mlp")] = h
                 else:
                     per_track_h = new_h
             else:
@@ -559,6 +571,12 @@ class PTWrappedModel(nn.Module):
                         h = Hm
                     block_start = Hm
                     carry = Hm
+                elif i == last:
+                    h = self.sync_module(new_h, R, stacked=True)
+                    if i in tap_mlp:
+                        sync_hiddens[i] = h
+                    if probe_capture is not None:
+                        probe_capture[(i, "mlp")] = h
                 else:
                     carry = new_h
             else:

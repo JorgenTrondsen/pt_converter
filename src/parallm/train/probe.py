@@ -436,19 +436,18 @@ def summary_lines(digest: dict, step: int, every: int = 8) -> list[str]:
     JSONL, this is only enough to see at a glance that the probe ran and that the
     alignment rail is where it should be.
 
-    The rail EXCLUDES the final layer. That is the one layer whose sync lands
-    post-MLP (the LM head needs a full residual), so its mixer — and therefore its
-    MLP — runs on the partial and it reads high by construction. Folding it into
-    the max would make a healthy probe print a number that looks like a failure.
+    The rail is the post-MLP column at EVERY layer — the TF loop reconstructs each
+    layer's post-MLP from the teacher's own residual, so a non-floor value means the
+    probe is misaligned. Post-attn rows are supposed to be non-zero: that is the d1b
+    seam. (The final layer was exempt until 2026-08-18, when it became a boundary.)
     """
     layers = sorted(digest)
     last = layers[-1]
     picked = [i for i in layers if i % every == 0 or i == last]
     body = " ".join(f"{i}:{digest[i][0]:.4f}/{digest[i][1]:.5f}" for i in picked)
-    rail = max(digest[i][1] for i in layers if i != last)
+    rail = max(digest[i][1] for i in layers)
     return [
         f"[probe] step {step} merged relMSE attn/mlp @L{{{','.join(str(i) for i in picked)}}}: {body}",
-        f"[probe] step {step} alignment rail: max post-mlp merged relMSE over L<{last} "
-        f"= {rail:.2e} (≈0 while student==teacher weights); "
-        f"L{last} = {digest[last][1]:.3f}, partial-input by construction",
+        f"[probe] step {step} alignment rail: max post-mlp merged relMSE over all "
+        f"{len(layers)} layers = {rail:.2e} (≈0 while student==teacher weights)",
     ]

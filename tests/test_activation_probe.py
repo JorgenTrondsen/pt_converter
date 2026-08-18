@@ -101,24 +101,20 @@ def test_post_mlp_reproduces_the_teacher_the_alignment_rail(tmp_path):
     reads the teacher's own post-attn tensor, shared by every track. So the only
     way it can be non-zero is a wiring error in the probe itself.
 
-    The FINAL layer is the documented exception and is checked separately below:
-    it is the one layer whose sync lands post-MLP (the LM head needs a full
-    residual), so its mixer — and therefore its MLP input — runs on the partial.
+    NO LAYER IS EXEMPT. The final layer used to be — it was excluded from the
+    post-attn sync set, so its mixer ran on the partial and this row read 0.345 at
+    d1b/N=64. That was a defect, not a law: it is a full boundary now, and repairing
+    it took that row to the bf16 floor and bought +0.2157 mmlu_pro_math_mc.
     """
     _losses, rows, _k = _run(tmp_path)
     merged = {r["layer"]: r for r in _by(rows, "mlp", merged=True)}
     assert len(merged) == L
-    for i in range(L - 1):
+    for i in range(L):
         assert merged[i]["res_relmse"] == 0.0, (
             f"L{i} post-mlp merged relMSE {merged[i]['res_relmse']:.3e} — misaligned"
         )
         assert abs(merged[i]["res_cos"] - 1.0) < 1e-6
         assert abs(merged[i]["res_nr"] - 1.0) < 1e-6
-    # ...and the exception is real, not an accident of tolerance.
-    assert merged[L - 1]["res_relmse"] > 1e-6, (
-        "the final layer's MLP reads the partial residual, so it must NOT be exact; "
-        "if it is, the last layer is being teacher-forced and the row is mislabelled"
-    )
 
 
 def test_post_attn_is_not_zero_or_the_rail_above_is_vacuous(tmp_path):
@@ -145,19 +141,16 @@ def test_post_mlp_normed_input_is_a_pure_norm_drift_meter(tmp_path):
     what later makes it the size of the confound in the post-attn nin_* row,
     which mixes residual error with `input_layernorm.weight` drift.
 
-    Again the final layer is excluded: its MLP input is the per-track partial.
+    The final layer is included: it is a full boundary, so its MLP normalizes the
+    teacher's residual like every other boundary's.
     """
     _losses, rows, _k = _run(tmp_path)
-    scored = [r for r in _by(rows, "mlp", merged=False) if r["layer"] < L - 1]
+    scored = _by(rows, "mlp", merged=False)
     assert scored
     for r in scored:
         assert r["nin_relmse"] == 0.0, (r["layer"], r["track"], r["nin_relmse"])
         assert abs(r["nin_cos"] - 1.0) < 1e-6
         assert abs(r["nin_nr"] - 1.0) < 1e-6
-    last = [r for r in _by(rows, "mlp", merged=False) if r["layer"] == L - 1]
-    assert max(r["nin_relmse"] for r in last) > 1e-6, (
-        "the final layer's MLP normalizes a partial residual — it cannot match"
-    )
 
 
 def test_merged_rows_report_no_normed_input(tmp_path):
@@ -256,12 +249,11 @@ def test_d2_schedule_teacher_forces_only_the_boundaries(tmp_path):
 
     Only a BOUNDARY layer's MLP reads the teacher's residual (the loop resets the
     carry there). A non-boundary layer's MLP reads the partial its own mixer
-    produced, so it must NOT be exact. This is the D>1 analogue of the final-layer
-    exception at d1b, and it is the rail that says the probe is reading the D>1
-    walk correctly rather than silently re-deriving the d1b one.
+    produced, so it must NOT be exact — the rail that says the probe is reading the
+    D>1 walk correctly rather than silently re-deriving the d1b one.
     """
-    sched = [1, 3, 5, 7]                      # D=2 over 8 layers
-    boundaries = set(sched) - {L - 1}         # the layers that sync post-attn
+    sched = [1, 3, 5, 7]                      # D=2 over 8 layers; L-1 IS a boundary
+    boundaries = set(sched)
     cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=sched, n_layers=L)
     teacher = _teacher(cfg, tracks)
     pt.set_sync_phase("post-attn")

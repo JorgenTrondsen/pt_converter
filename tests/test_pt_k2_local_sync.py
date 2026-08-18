@@ -207,3 +207,66 @@ def test_post_attn_capture_sets_cover_every_metric_layer():
             capture_post_mlp=cap_mlp,
         )
     assert set(partial) == {1, 3, 5, 7}, "mid-window at post-attn is now implemented — update this rail"
+
+
+def test_final_layer_mlp_reads_the_synced_residual():
+    """The final layer is a full boundary, so its MLP reads the post-attn SYNCED
+    residual R and the head sees ``R + Σ_k mlp_k(R)``. K=2 is the minimum that can
+    catch a wrong pre-state — `SyncBoundary` computes ``pre + Σ_k (h_k − pre)``, so
+    at K=1 the short-circuit skips the sum entirely.
+    """
+    from parallm.model.seam import checkpointed_halves
+    from parallm.train.distill import capture_sets
+
+    torch.manual_seed(5)
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+        sync_after_layers=list(range(L)), track_group=None,
+    ).eval()
+    pt.set_sync_phase("post-attn")
+
+    cap_attn, cap_mlp = capture_sets(pt.sync_after_layers, L, False)
+    assert cap_attn == set(range(L)) and cap_mlp == set()
+
+    with torch.no_grad():
+        hidden, hiddens = pt(
+            input_ids=torch.randint(0, cfg.vocab_size, (1, 8)),
+            attention_mask=torch.ones((1, 8), dtype=torch.long),
+            return_sync_hiddens=True, return_hidden_pre_lm_head=True,
+            capture_post_attn=cap_attn, capture_post_mlp=cap_mlp,
+        )
+    assert set(hiddens) == set(range(L))
+
+    _, run_mlp = checkpointed_halves(False, None, None)
+    R = hiddens[L - 1]
+    with torch.no_grad():
+        per_track = [run_mlp(tm.layers[L - 1], R) for tm in pt.text_models]
+        expected = pt.text_models[0].norm(pt.sync_module(per_track, R))
+    torch.testing.assert_close(hidden, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_schedule_omitting_the_last_layer_still_syncs_it_post_mlp():
+    """The own-carry branch is now only reachable at the last layer via a schedule
+    that does not name it, so nothing else covers it."""
+    from parallm.train.distill import capture_sets
+
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    sync = [1, 3, 5]  # deliberately no L-1
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+        sync_after_layers=sync, track_group=None,
+    ).eval()
+    pt.set_sync_phase("post-attn")
+    cap_attn, cap_mlp = capture_sets(sync, L, False)
+    assert cap_attn == set(sync) and cap_mlp == {L - 1}
+    with torch.no_grad():
+        _, hiddens = pt(
+            input_ids=torch.randint(0, cfg.vocab_size, (1, 8)),
+            attention_mask=torch.ones((1, 8), dtype=torch.long),
+            return_sync_hiddens=True,
+            capture_post_attn=cap_attn, capture_post_mlp=cap_mlp,
+        )
+    assert set(hiddens) == set(sync) | {L - 1}

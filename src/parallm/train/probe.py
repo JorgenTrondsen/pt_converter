@@ -168,9 +168,10 @@ def track_gram(deltas: list[torch.Tensor], mask: torch.Tensor | None,
     """
     x = torch.stack(deltas, 0) if not isinstance(deltas, torch.Tensor) else deltas
     if mask is not None and not bool(mask.all()):
-        m = mask.to(x.dtype)
-        while m.ndim < x.ndim:
-            m = m.unsqueeze(-1) if m.ndim > 1 else m.unsqueeze(0)
+        # (B, T) onto x's MIDDLE axes. Right-aligned padding lands the mask's T on
+        # x's B; unreachable so far only because the training mask is all ones.
+        m = mask.to(x.dtype).reshape(
+            (1,) * (x.ndim - mask.ndim - 1) + tuple(mask.shape) + (1,))
         x = x * m
     x = x.reshape(x.shape[0], -1).contiguous()
     if dist.is_available() and dist.is_initialized():

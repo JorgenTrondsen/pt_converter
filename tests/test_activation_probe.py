@@ -367,3 +367,19 @@ def test_probe_survives_streamed_teacher_layers(tmp_path):
         a = next(mod.parameters())
         b = next(probe_streamed._t_norms[k].parameters())
         assert a.numel() > 0 and torch.equal(a, b), f"{k}: norm clone lost its weights"
+
+
+def test_track_gram_masks_the_right_axes():
+    """Masking to a position must equal slicing it. Right-aligned padding put the
+    (B, T) mask's T on x's B; the all-ones training mask kept that unreachable."""
+    from parallm.train.probe import track_gram
+
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, 5, 8)  # (K, B, T, H), B != T so a wrong axis raises
+    keep = torch.zeros(4, 5, dtype=torch.long)
+    keep[:, 2] = 1
+
+    masked = track_gram(list(x.unbind(0)), keep)
+    sliced = track_gram(list(x[:, :, 2:3, :].unbind(0)), None)
+    assert all(abs(a - b) < 1e-4 for a, b in zip(masked, sliced)), (masked, sliced)
+    assert abs(masked[0] - track_gram(list(x.unbind(0)), None)[0]) > 1e-6

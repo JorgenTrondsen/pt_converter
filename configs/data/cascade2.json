@@ -1,11 +1,11 @@
 {
   "sources": [
     {
-      "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",
-      "config": "math",
+      "dataset": "nvidia/Nemotron-SFT-Math-v4",
       "weight": 0.3,
       "format": "chat",
-      "field": "messages"
+      "field": "messages",
+      "shuffle_buffer": 2000
     },
     {
       "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data",

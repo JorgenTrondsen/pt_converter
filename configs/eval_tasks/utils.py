@@ -25,8 +25,15 @@ def letter_choices(doc) -> list[str]:
 
 
 def letter_target(doc) -> int:
-    """Index of the gold letter in ``letter_choices``."""
-    return LETTERS.index(doc["answer"].strip().upper())
+    """Index of the gold letter in ``letter_choices``.
+
+    ``answer`` is a letter on MMLU-Pro/CodeMMLU but already an integer index on
+    cais/mmlu, so accept both rather than fork the formatter.
+    """
+    answer = doc["answer"]
+    if isinstance(answer, int):
+        return answer
+    return LETTERS.index(answer.strip().upper())
 
 
 def _lettered(prompt: str, doc) -> str:
@@ -35,14 +42,59 @@ def _lettered(prompt: str, doc) -> str:
     return prompt + "Answer:"
 
 
-# ----- mmlu_pro_math_mc (TIGER-Lab/MMLU-Pro, category == "math") -----
+# ----- the MMLU-family tasks -----
+# One rendering over three slices, so a difference between them is the SUBJECT and
+# nothing else: cais/mmlu math (the macro's math slot) and cais/mmlu computer
+# science (its control), both 4 options / chance 0.25; plus TIGER-Lab/MMLU-Pro math
+# (up to 10, chance 0.10), off-macro so a checkpoint can be scored on both sources.
 
-def filter_math(dataset):
+def mmlu_doc_to_text(doc) -> str:
+    return _lettered(f"{doc['question']}\n", doc)
+
+
+def filter_mmlu_pro_math(dataset):
     return dataset.filter(lambda doc: doc["category"] == "math")
 
 
-def mmlu_pro_doc_to_text(doc) -> str:
-    return _lettered(f"{doc['question']}\n", doc)
+# Subcategories of the original MMLU taxonomy (hendrycks et al.'s categories.py),
+# not ad-hoc subject picks — which is what makes `math` the counterpart of
+# MMLU-Pro's math category, and `cs` a like-for-like control against it.
+MMLU_MATH_SUBJECTS = frozenset({
+    "abstract_algebra",
+    "college_mathematics",
+    "elementary_mathematics",
+    "high_school_mathematics",
+    "high_school_statistics",
+})  # 1064 test docs
+
+MMLU_CS_SUBJECTS = frozenset({
+    "college_computer_science",
+    "computer_security",
+    "high_school_computer_science",
+    "machine_learning",
+})  # 412 test docs
+
+
+def _subject_slice(dataset, subjects):
+    """Docs in ``subjects`` only, in a fixed shuffled order.
+
+    The shuffle is load-bearing, not cosmetic. lm-eval's ``--limit`` / the
+    trainer's ``--eval-limit`` take an ordered PREFIX of the docs, and cais/mmlu
+    ships its test split sorted by subject — so an unshuffled limit-200 of the math
+    slice would score abstract_algebra + college_mathematics and nothing else,
+    missing all 864 elementary/high-school docs. The seed is fixed, so the prefix is
+    the same sample on every run and at every step, and ``--limit 0`` scores the
+    same docs either way.
+    """
+    return dataset.filter(lambda doc: doc["subject"] in subjects).shuffle(seed=1234)
+
+
+def filter_mmlu_math(dataset):
+    return _subject_slice(dataset, MMLU_MATH_SUBJECTS)
+
+
+def filter_mmlu_cs(dataset):
+    return _subject_slice(dataset, MMLU_CS_SUBJECTS)
 
 
 # ----- codemmlu_fim (Fsoft-AIC/CodeMMLU, fill_in_the_middle) -----

@@ -61,7 +61,7 @@ def test_task_dir_resolves_off_the_package(monkeypatch, tmp_path):
 
 def test_shipped_yamls_cover_the_non_builtin_default_tasks():
     shipped = {_read(p)["task"] for p in _yamls()}
-    assert {"mmlu_pro_math_mc", "codemmlu_fim"} <= shipped
+    assert {"mmlu_math_mc", "codemmlu_fim"} <= shipped
     # arc_* are lm-eval built-ins and deliberately NOT redefined here.
     assert shipped.isdisjoint({"arc_easy", "arc_challenge"})
 
@@ -76,12 +76,36 @@ def test_every_task_is_loglikelihood_shaped(path):
     assert path.stem == cfg["task"]  # include_path resolves by filename
 
 
-def test_math_task_is_two_shot_and_code_task_is_zero_shot():
+def test_math_tasks_are_two_shot_and_code_task_is_zero_shot():
     # Pinned in the YAMLs, not on the command line: a YAML-level num_fewshot cannot
     # be overridden by --num-fewshot, and codemmlu shots would be whole code files.
     cfgs = {_read(p)["task"]: _read(p) for p in _yamls()}
+    assert cfgs["mmlu_math_mc"]["num_fewshot"] == 2
+    assert cfgs["mmlu_cs_mc"]["num_fewshot"] == 2
     assert cfgs["mmlu_pro_math_mc"]["num_fewshot"] == 2
     assert cfgs["codemmlu_fim"]["num_fewshot"] == 0
+
+
+def test_mmlu_cs_differs_from_mmlu_math_in_the_SUBJECT_AND_NOTHING_ELSE():
+    """The control is only a control if every other knob matches. A stray difference
+    in shots/options/renderer would confound 'CS vs math' with 'task B vs task A'."""
+    math_cfg, cs_cfg = _read(TASK_DIR / "mmlu_math_mc.yaml"), _read(TASK_DIR / "mmlu_cs_mc.yaml")
+    differing = {k for k in set(math_cfg) | set(cs_cfg) if math_cfg.get(k) != cs_cfg.get(k)}
+    assert differing == {"task", "process_docs"}
+
+
+@pytest.mark.parametrize("task_name, subjects", [
+    ("mmlu_math_mc", "MMLU_MATH_SUBJECTS"),
+    ("mmlu_cs_mc", "MMLU_CS_SUBJECTS"),
+])
+def test_mmlu_slices_draw_their_shots_from_the_same_subjects(task_name, subjects):
+    """The shots come out of a 57-subject dev split, so they are on-subject only
+    because lm-eval defaults fewshot_config.process_docs to the task-level
+    process_docs. Needs the [eval] extra: it is that default, not our YAML, under test."""
+    tasks = pytest.importorskip("lm_eval.tasks")
+    task = tasks.TaskManager(include_path=EVAL_TASK_PATH).load(task_name)["tasks"][task_name]
+    shots = list(task.fewshot_docs())[: task.config.num_fewshot]
+    assert shots and all(d["subject"] in getattr(utils, subjects) for d in shots)
 
 
 # ----- the doc formatters -----
@@ -90,6 +114,11 @@ def test_letter_choices_and_target():
     doc = {"options": ["a", "b", "c"], "answer": "B"}
     assert utils.letter_choices(doc) == ["A", "B", "C"]
     assert utils.letter_target(doc) == 1
+
+
+def test_letter_target_accepts_an_integer_answer():
+    # cais/mmlu stores `answer` as the 0-based index, not a letter.
+    assert utils.letter_target({"choices": ["a", "b", "c", "d"], "answer": 2}) == 2
 
 
 def test_letter_target_tolerates_whitespace_and_case():
@@ -102,9 +131,49 @@ def test_mmlu_pro_supports_ten_options():
     doc = {"question": "q", "options": [str(i) for i in range(10)], "answer": "J"}
     assert utils.letter_choices(doc)[-1] == "J"
     assert utils.letter_target(doc) == 9
-    text = utils.mmlu_pro_doc_to_text(doc)
+    text = utils.mmlu_doc_to_text(doc)
     assert text.startswith("q\n")
     assert text.endswith("Answer:")  # single-letter continuation, the cheapest shape
+
+
+def test_mmlu_filters_are_the_original_taxonomy_subcategories():
+    # Taxonomy subcategories, not ad-hoc picks — that is what makes cs a like-for-like
+    # control for math rather than another benchmark.
+    assert utils.MMLU_MATH_SUBJECTS == {
+        "abstract_algebra", "college_mathematics", "elementary_mathematics",
+        "high_school_mathematics", "high_school_statistics"}
+    assert utils.MMLU_CS_SUBJECTS == {
+        "college_computer_science", "computer_security",
+        "high_school_computer_science", "machine_learning"}
+    assert not (utils.MMLU_MATH_SUBJECTS & utils.MMLU_CS_SUBJECTS)
+
+
+@pytest.mark.parametrize("fn, subjects", [
+    (utils.filter_mmlu_math, utils.MMLU_MATH_SUBJECTS),
+    (utils.filter_mmlu_cs, utils.MMLU_CS_SUBJECTS),
+])
+def test_mmlu_filters_shuffle_deterministically(fn, subjects):
+    """--limit/--eval-limit take an ordered PREFIX and cais/mmlu is sorted by
+    subject, so an unshuffled filter would score one or two subjects at limit 200.
+    The seed is fixed so the prefix is the same sample on every run."""
+    datasets = pytest.importorskip("datasets")
+    ordered = sorted(subjects) + ["anatomy"]  # subject-sorted, as it ships
+    rows = [{"subject": s, "question": f"{s}-{i}"} for s in ordered for i in range(20)]
+    got = fn(datasets.Dataset.from_list(rows))
+
+    assert {d["subject"] for d in got} == set(subjects)  # anatomy dropped
+    order = [d["question"] for d in got]
+    assert order != [r["question"] for r in rows if r["subject"] != "anatomy"]  # shuffled
+    assert len(set(d["subject"] for d in got.select(range(20)))) > 1  # prefix spans subjects
+    stable = fn(datasets.Dataset.from_list(rows))
+    assert order == [d["question"] for d in stable]  # and the same shuffle every time
+
+
+def test_mmlu_renders_a_four_way_doc():
+    """cais/mmlu docs carry `choices`, not `options`, and 4 of them — chance 0.25."""
+    doc = {"question": "q", "choices": ["w", "x", "y", "z"], "answer": 3}
+    assert utils.letter_choices(doc) == ["A", "B", "C", "D"]
+    assert utils.mmlu_doc_to_text(doc) == "q\nA. w\nB. x\nC. y\nD. z\nAnswer:"
 
 
 def test_codemmlu_includes_the_problem_description_when_present():

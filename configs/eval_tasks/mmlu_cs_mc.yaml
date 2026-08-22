@@ -1,0 +1,34 @@
+# THE SUBJECT-MATCHED CONTROL FOR mmlu_math_mc. Same dataset, same lettered
+# rendering, same 4 options, same 2 shots — the only thing that differs is what the
+# questions are about (the original taxonomy's "computer science" subcategory: 412
+# test docs over college_computer_science, computer_security,
+# high_school_computer_science, machine_learning).
+#
+# It exists to read one thing. Math decays across training while codemmlu_fim rises,
+# and mmlu_math_mc is otherwise the ONLY cais/mmlu task in the set — so "math decays"
+# cannot currently be told apart from "cais/mmlu decays". This is the missing cell:
+#
+#   CS decays like math  => the effect is MMLU-format-wide and math is the wrong axis
+#   CS holds, math falls => genuinely the subject, and the math levers are aimed right
+#
+# NOT in DEFAULT_TASKS: adding it would change what "macro" means and void every
+# macro= already in logs/. Pass it via --tasks / --eval-tasks.
+#
+# 412 docs => sigma ~0.031 at limit 200, ~0.021 at --limit 0. Read against 0.25.
+task: mmlu_cs_mc
+dataset_path: cais/mmlu
+dataset_name: all
+test_split: test
+fewshot_split: dev
+fewshot_config:
+  sampler: first_n
+process_docs: !function utils.filter_mmlu_cs
+output_type: multiple_choice
+doc_to_text: !function utils.mmlu_doc_to_text
+doc_to_choice: !function utils.letter_choices
+doc_to_target: !function utils.letter_target
+num_fewshot: 2
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true

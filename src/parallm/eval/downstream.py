@@ -18,12 +18,22 @@ EVAL_TASK_PATH = str(Path(__file__).resolve().parents[3] / "configs" / "eval_tas
 
 # The macro task set, shared by the trainer's in-loop eval and the standalone
 # script so the two report the same number: reasoning (arc_easy / arc_challenge),
-# math (mmlu_pro_math_mc) and code (codemmlu_fim).
+# math (mmlu_math_mc), knowledge (mmlu_cs_mc) and code (codemmlu_fim).
 #
 # Changing this changes what "macro" means and silently voids comparability with
 # every macro= already recorded in logs/ — re-baseline rather than compare across
 # a change. Pass --tasks/--eval-tasks for a one-off instead of editing this.
-DEFAULT_TASKS = "arc_easy,arc_challenge,mmlu_pro_math_mc,codemmlu_fim"
+#
+# mmlu_math_mc and mmlu_cs_mc are the same cais/mmlu rendering over two taxonomy
+# subcategories, so a difference between them is the SUBJECT and nothing else —
+# which is what lets a math result be checked against a control instead of against
+# arc/code, whose prompts, shot counts and option depths all differ.
+#
+# ⚠ The math slot was mmlu_pro_math_mc (TIGER-Lab/MMLU-Pro, 10-way) until
+# 2026-08-21, and mmlu_cs_mc joined on 2026-08-22. Every macro= in logs/ before
+# those dates is a different number. mmlu_pro_math_mc still ships in
+# configs/eval_tasks and can be scored by name for a side-by-side.
+DEFAULT_TASKS = "arc_easy,arc_challenge,mmlu_math_mc,mmlu_cs_mc,codemmlu_fim"
 
 
 class MissingTasks(KeyError):
@@ -53,9 +63,9 @@ def macro_metrics(
     Iterates the expected task list rather than the results table, for two reasons.
     A group task puts its subtasks in the table alongside the group, and averaging
     those would swamp the macro. And a task that failed to load would otherwise
-    vanish without trace — which is not a neutral failure: dropping
-    ``mmlu_pro_math_mc``, reliably the lowest scorer, *raises* the macro by ~0.07,
-    so a hub outage would read as a win and could promote a worse checkpoint.
+    vanish without trace — which is not a neutral failure: dropping the math task,
+    reliably the lowest scorer, *raises* the macro, so a hub outage would read as a
+    win and could promote a worse checkpoint.
 
     ``results`` is ``None`` on every rank but global rank 0 (``simple_evaluate``
     returns nothing elsewhere), which yields ``{}``.

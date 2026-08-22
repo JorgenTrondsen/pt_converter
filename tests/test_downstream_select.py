@@ -18,12 +18,25 @@ def _results(**task_metrics):
     return {"results": dict(task_metrics)}
 
 
-def _ledger(arc_easy, arc_challenge, mmlu_pro_math_mc, codemmlu_fim):
-    """The four-task table as lm-eval emits it, ``,none`` filter suffix and all."""
+# The task list a real recorded eval was scored on, before mmlu_cs_mc joined the
+# macro. The historical numbers below are only meaningful against THIS list.
+RECORDED_FOUR = "arc_easy,arc_challenge,mmlu_math_mc,codemmlu_fim"
+
+
+def _ledger(arc_easy, arc_challenge, mmlu_math_mc, codemmlu_fim, mmlu_cs_mc=0.7900):
+    """The macro table as lm-eval emits it, ``,none`` filter suffix and all.
+
+    Only the arithmetic is under test here, so the recorded values callers pass are
+    kept verbatim from a real eval even though its math slot was the older
+    mmlu_pro_math_mc — the macro is the same mean either way. ``mmlu_cs_mc`` has a
+    default because it postdates those recordings; tests pinning a historical
+    number score against ``RECORDED_FOUR`` so the extra row cannot shift it.
+    """
     return _results(
         arc_easy={"acc,none": arc_easy, "acc_norm,none": arc_easy + 0.02},
         arc_challenge={"acc,none": arc_challenge, "acc_norm,none": arc_challenge + 0.02},
-        mmlu_pro_math_mc={"acc,none": mmlu_pro_math_mc},
+        mmlu_math_mc={"acc,none": mmlu_math_mc},
+        mmlu_cs_mc={"acc,none": mmlu_cs_mc},
         codemmlu_fim={"acc,none": codemmlu_fim},
     )
 
@@ -32,7 +45,7 @@ def _ledger(arc_easy, arc_challenge, mmlu_pro_math_mc, codemmlu_fim):
 
 def test_default_tasks_are_the_recorded_macro():
     assert DEFAULT_TASKS.split(",") == [
-        "arc_easy", "arc_challenge", "mmlu_pro_math_mc", "codemmlu_fim"]
+        "arc_easy", "arc_challenge", "mmlu_math_mc", "mmlu_cs_mc", "codemmlu_fim"]
 
 
 def test_task_spec_accepts_a_string_or_a_list():
@@ -48,9 +61,10 @@ def test_macro_reproduces_the_cascade2_ab_ledger():
 
     logs/qwen3/32b_d1b_nemo_ab.log, raw arm, step 625:
       macro=0.6462 arc_easy=0.7550 arc_challenge=0.5500
-      mmlu_pro_math_mc=0.4350 codemmlu_fim=0.8450
+      mmlu_math_mc=0.4350 codemmlu_fim=0.8450
     """
-    assert macro(_ledger(0.7550, 0.5500, 0.4350, 0.8450)) == pytest.approx(0.6462, abs=1e-4)
+    got = macro(_ledger(0.7550, 0.5500, 0.4350, 0.8450), RECORDED_FOUR)
+    assert got == pytest.approx(0.6462, abs=1e-4)
 
 
 def test_acc_is_the_metric_not_acc_norm():
@@ -58,8 +72,8 @@ def test_acc_is_the_metric_not_acc_norm():
     # is meaningless — taking acc_norm would report a different number than the
     # ledger. The ``,none`` filter suffix must be stripped.
     m = macro_metrics(_ledger(0.7550, 0.5500, 0.4350, 0.8450))
-    assert m == {"arc_easy": 0.7550, "arc_challenge": 0.5500,
-                 "mmlu_pro_math_mc": 0.4350, "codemmlu_fim": 0.8450}
+    assert m == {"arc_easy": 0.7550, "arc_challenge": 0.5500, "mmlu_math_mc": 0.4350,
+                 "mmlu_cs_mc": 0.7900, "codemmlu_fim": 0.8450}
 
 
 def test_macro_off_rank0_is_zero():
@@ -73,16 +87,16 @@ def test_macro_off_rank0_is_zero():
 def test_a_partial_result_raises_instead_of_averaging_the_survivors():
     """The failure mode this guards: dropping the lowest scorer RAISES the macro.
 
-    mmlu_pro_math_mc sits ~0.2 below the rest, so averaging over "whatever scored"
-    turns a hub outage into an apparent +0.07 win — and best/ would promote it.
+    The math task sits well below the rest, so averaging over "whatever scored"
+    turns a hub outage into an apparent win — and best/ would promote it.
     """
     full = _ledger(0.7550, 0.5500, 0.4350, 0.8450)
-    partial = _results(**{k: v for k, v in full["results"].items() if k != "mmlu_pro_math_mc"})
+    partial = _results(**{k: v for k, v in full["results"].items() if k != "mmlu_math_mc"})
     with pytest.raises(MissingTasks) as e:
         macro_metrics(partial)
-    assert "mmlu_pro_math_mc" in str(e.value)
+    assert "mmlu_math_mc" in str(e.value)
     # and the number it would have reported is HIGHER than the true macro.
-    survivors = [0.7550, 0.5500, 0.8450]
+    survivors = [0.7550, 0.5500, 0.7900, 0.8450]
     assert sum(survivors) / len(survivors) > macro(full)
 
 
@@ -98,13 +112,13 @@ def test_group_subtasks_do_not_leak_into_the_macro():
     table instead of the expected list would average ~19 extra rows."""
     res = _ledger(0.7550, 0.5500, 0.4350, 0.8450)
     res["results"].update({f"mmlu_stem_sub{i}": {"acc,none": 0.01} for i in range(19)})
-    assert macro(res) == pytest.approx(0.6462, abs=1e-4)
+    assert macro(res, RECORDED_FOUR) == pytest.approx(0.6462, abs=1e-4)
 
 
 def test_an_explicit_task_subset_is_scored_alone():
-    # `--tasks mmlu_pro_math_mc --limit 0`, the unbiased math rescore.
+    # `--tasks mmlu_math_mc --limit 0`, the unbiased math rescore.
     res = _ledger(0.7550, 0.5500, 0.4350, 0.8450)
-    assert macro(res, "mmlu_pro_math_mc") == pytest.approx(0.4350)
+    assert macro(res, "mmlu_math_mc") == pytest.approx(0.4350)
 
 
 def test_unlisted_tasks_default_to_acc():

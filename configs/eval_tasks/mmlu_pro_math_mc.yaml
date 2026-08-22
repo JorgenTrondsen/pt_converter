@@ -7,15 +7,18 @@
 # doc_to_choice adapts) => the chance floor is ~0.10, NOT the 0.25 of a 4-way task.
 # Read this task's accuracy against 0.10, not against arc's floor.
 # num_fewshot is 2 so a prompt still fits the trainer's 2048-token eval cap.
+#
+# NOT in DEFAULT_TASKS any more — mmlu_math_mc holds the macro's math slot. Kept
+# so a checkpoint can still be rescored here: pass it to --tasks/--eval-tasks.
 task: mmlu_pro_math_mc
 dataset_path: TIGER-Lab/MMLU-Pro
 test_split: test
 fewshot_split: validation
 fewshot_config:
   sampler: first_n
-process_docs: !function utils.filter_math
+process_docs: !function utils.filter_mmlu_pro_math
 output_type: multiple_choice
-doc_to_text: !function utils.mmlu_pro_doc_to_text
+doc_to_text: !function utils.mmlu_doc_to_text
 doc_to_choice: !function utils.letter_choices
 doc_to_target: !function utils.letter_target
 num_fewshot: 2

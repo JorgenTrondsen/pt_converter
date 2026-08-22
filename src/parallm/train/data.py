@@ -50,6 +50,15 @@ class DataSourceSpec:
       * ``"chat"``     — run ``field`` (default ``messages``) through the tokenizer's
         chat template. This is what lets a ``messages``-format SFT corpus be trained on.
 
+    ``shuffle_buffer`` (0 = off, the default) reservoir-shuffles this source and
+    randomizes its shard order. **It is off by default because turning it on changes
+    which documents a run trains on, and every mixture recorded so far read its
+    sources in file order** — enabling it on an existing preset voids comparability
+    with the runs already in ``logs/``. Turn it on for a NEW preset whose source is
+    ordered: a run consumes only ``steps * batch * seq_len`` tokens (~2M, i.e. ~100
+    documents of a long-form SFT corpus), so a corpus grouped by sub-source or
+    subset would otherwise contribute only its first group.
+
     Sources must be parquet-native (standard-format) datasets — modern ``datasets``
     no longer supports script-based loaders (e.g. ``codeparrot/github-code-clean``);
     use parquet mirrors instead.
@@ -63,6 +72,7 @@ class DataSourceSpec:
     format: str = "text"
     template: str | None = None
     field: str | None = None
+    shuffle_buffer: int = 0
 
     def label(self) -> str:
         return f"{self.dataset_name}:{self.dataset_config}" if self.dataset_config else self.dataset_name
@@ -118,18 +128,25 @@ def render_fn(spec: DataSourceSpec, tokenizer):
     raise ValueError(f"unknown source format {spec.format!r} (text|template|chat)")
 
 
-def _load_rendered(spec: DataSourceSpec, tokenizer):
+def _load_rendered(spec: DataSourceSpec, tokenizer, seed: int = 42):
     """Stream one source and normalize it to a single ``"text"`` column.
 
     Dropping the original columns is not cosmetic: ``interleave_datasets`` requires
     a shared feature schema, so this is what lets a chat corpus and a plain-text
     corpus sit in one mixture.
+
+    ``seed`` only matters when the spec opts into ``shuffle_buffer``; it is the
+    config seed so every rank draws the identical stream.
     """
     from datasets import load_dataset  # local: avoid hard dep at module load
 
     ds = load_dataset(
         spec.dataset_name, spec.dataset_config, split=spec.split, streaming=True,
     )
+    if spec.shuffle_buffer:
+        # Shuffles shard ORDER as well as buffering rows, which is the half that
+        # matters for a corpus grouped by sub-source across shards.
+        ds = ds.shuffle(seed=seed, buffer_size=spec.shuffle_buffer)
     return ds.map(render_fn(spec, tokenizer), remove_columns=list(ds.column_names or []))
 
 
@@ -325,7 +342,7 @@ class PackedTokenStream(IterableDataset):
             sources = cfg.sources
         else:
             sources = cfg.sources
-            streams = [_load_rendered(s, tokenizer) for s in sources]
+            streams = [_load_rendered(s, tokenizer, cfg.seed) for s in sources]
 
         # Price each source in tokens before interleaving. Skipped for a single
         # source, where the weight is unused anyway.

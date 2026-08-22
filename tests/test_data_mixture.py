@@ -51,12 +51,44 @@ def test_every_shipped_mixture_loads():
 
 
 def test_default_mixture_is_cascade2():
+    """Four Cascade-2 configs plus a DEDICATED math source: the math slot was moved
+    off `Nemotron-Cascade-2-SFT-Data:math` onto `Nemotron-SFT-Math-v4` (2026-08-22)
+    at the same 0.30 token share, so the mixture shape is unchanged and only the
+    math corpus differs."""
     srcs = preset_sources("cascade2")
-    assert {s.dataset_config for s in srcs} == {
-        "math", "science", "swe", "chat", "instruction_following"}
-    assert all(s.dataset_name == "nvidia/Nemotron-Cascade-2-SFT-Data" for s in srcs)
     assert all(s.format == "chat" and s.field == "messages" for s in srcs)
     assert pytest.approx(sum(s.weight for s in srcs), rel=1e-6) == 1.0
+
+    cascade = [s for s in srcs if s.dataset_name == "nvidia/Nemotron-Cascade-2-SFT-Data"]
+    assert {s.dataset_config for s in cascade} == {
+        "science", "swe", "chat", "instruction_following"}
+
+    (math,) = [s for s in srcs if s.dataset_name == "nvidia/Nemotron-SFT-Math-v4"]
+    assert math.weight == pytest.approx(0.3)
+    # Grouped by sub-source across shards, so it needs the shuffle for the same
+    # reason the math-only preset does — see test_nemo_math_v4_... below.
+    assert math.shuffle_buffer > 0
+
+
+def test_nemo_math_v4_is_a_single_shuffled_chat_source():
+    """The math-only mixture. `shuffle_buffer` is the load-bearing part: a run
+    consumes ~2M tokens ≈ ~100 docs of this corpus, and the parquet is grouped by
+    sub-source (AoPS first, Math StackExchange later) and subset (cot vs tir), so
+    unshuffled it would train on AoPS/cot alone."""
+    (src,) = preset_sources("nemo_math_v4")
+    assert src.dataset_name == "nvidia/Nemotron-SFT-Math-v4"
+    assert (src.format, src.field) == ("chat", "messages")
+    assert src.shuffle_buffer > 0
+
+
+def test_shuffle_is_off_unless_a_source_opts_in():
+    """Enabling it changes WHICH documents a run sees, so a source that silently
+    gained a shuffle would void comparability with every macro in logs/. Only the
+    sources whose corpus is grouped carry it; the untouched Cascade-2 configs read
+    in file order exactly as they always have."""
+    assert DataSourceSpec(dataset_name="x").shuffle_buffer == 0
+    assert all(s.shuffle_buffer == 0 for s in preset_sources("cascade2")
+               if s.dataset_name == "nvidia/Nemotron-Cascade-2-SFT-Data")
 
 
 def test_calib_default_is_still_wikitext():
@@ -183,17 +215,24 @@ def test_equal_token_shares_over_a_length_spread_yield_equal_token_counts():
 
 
 def test_cascade2_weights_realize_as_the_recorded_split():
-    """Reproduces the realized split logged by the raw arm of the Cascade-2 A/B
-    (logs/qwen3/32b_d1b_nemo_ab.log): 30% of math's tokens is 5.2% of documents,
-    20% of swe's is 1.4%, and instruction_following takes 55.3% of the draws."""
+    """`weight` is a TOKEN share, and a 20x doc-length spread turns it into a wildly
+    different DOCUMENT share — the trap that once made a 34/33/33 mixture land as
+    66/32/2. Measured mean doc lengths, keyed by label() because the math source is
+    a whole dataset with no config: 30% of math's TOKENS is under 5% of the draws
+    while instruction_following's 15% takes over half of them.
+
+    Lengths are as logged (`logs/qwen3/32b_d1b_nemo_ab.log`) except math, measured
+    on Nemotron-SFT-Math-v4 after it replaced Cascade-2's math config."""
     srcs = preset_sources("cascade2")
-    measured = {"math": 19724.0, "science": 3832.0, "swe": 48340.0,
-                "chat": 2735.0, "instruction_following": 922.0}
-    probs = token_weights(srcs, [measured[s.dataset_config] for s in srcs])
-    by_config = {s.dataset_config: p for s, p in zip(srcs, probs)}
-    assert by_config["math"] == pytest.approx(0.052, abs=5e-4)
-    assert by_config["swe"] == pytest.approx(0.014, abs=5e-4)
-    assert by_config["instruction_following"] == pytest.approx(0.553, abs=5e-4)
+    C = "nvidia/Nemotron-Cascade-2-SFT-Data"
+    measured = {"nvidia/Nemotron-SFT-Math-v4": 21684.0, f"{C}:science": 3832.0,
+                f"{C}:swe": 48340.0, f"{C}:chat": 2735.0,
+                f"{C}:instruction_following": 922.0}
+    probs = token_weights(srcs, [measured[s.label()] for s in srcs])
+    by_label = {s.label(): p for s, p in zip(srcs, probs)}
+    assert by_label["nvidia/Nemotron-SFT-Math-v4"] == pytest.approx(0.047, abs=5e-4)
+    assert by_label[f"{C}:swe"] == pytest.approx(0.014, abs=5e-4)
+    assert by_label[f"{C}:instruction_following"] == pytest.approx(0.555, abs=5e-4)
 
 
 def test_zero_total_weight_raises():

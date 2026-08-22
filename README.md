@@ -92,15 +92,22 @@ torchrun --standalone --nproc-per-node=8 scripts/eval_fidelity.py \
     --hf-model <teacher> --checkpoint-dir ./pt_tracks --num-batches 200
 
 # downstream retention (the metric that matters — proxies hid failures before).
-# --tasks defaults to the 4-task macro: arc_easy, arc_challenge, mmlu_pro_math_mc,
-# codemmlu_fim. Name any lm-eval built-in, or any YAML in configs/eval_tasks.
+# --tasks defaults to the 5-task macro: arc_easy, arc_challenge, mmlu_math_mc,
+# mmlu_cs_mc, codemmlu_fim. Any lm-eval built-in, or any YAML in configs/eval_tasks.
 torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
     --hf-model <teacher> --checkpoint-dir ./pt_tracks
 
 # the unbiased math number: the limit-200 prefix of that task reads high
 torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
     --hf-model <teacher> --checkpoint-dir ./pt_tracks \
-    --tasks mmlu_pro_math_mc --limit 0
+    --tasks mmlu_math_mc --limit 0
+
+# mmlu_math_mc vs mmlu_cs_mc is the same rendering over two subjects, so a gap
+# between them is the SUBJECT alone. mmlu_pro_math_mc (the old 10-way math task) is
+# off-macro but still shipped, for a side-by-side against pre-2026-08-21 records
+torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
+    --hf-model <teacher> --checkpoint-dir ./pt_tracks \
+    --tasks mmlu_math_mc,mmlu_cs_mc,mmlu_pro_math_mc --limit 0
 ```
 
 Training data and eval tasks are both chosen at launch, no code change:

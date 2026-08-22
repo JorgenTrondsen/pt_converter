@@ -1,0 +1,35 @@
+# The macro's math slot: cais/mmlu restricted to the original taxonomy's "math"
+# subcategory (1064 test docs over 5 subjects), rendered as a single-letter
+# multiple-choice task like the rest of the set.
+#
+# Replaces mmlu_pro_math_mc there. Two differences that matter when reading the
+# number: 4 options, so the chance floor is 0.25 and not 0.10, and MMLU is the
+# easier of the two benchmarks — absolute math accuracy jumps, and NOTHING here
+# is comparable to a macro= recorded before the swap.
+#
+# num_fewshot is 2 to MATCH mmlu_pro_math_mc, so the two math numbers stay
+# comparable — NOT because of the 2048-token eval cap. cais/mmlu docs are small
+# (p50 73 tokens), so even 5 shots is only ~438 tokens; the cap is nowhere near
+# binding here. (It is a real constraint for codemmlu_fim, whose p90 doc would blow
+# 2048 at 5 shots — hence that task's `num_fewshot: 0`.) Shots ARE overridable from
+# the command line: lm-eval only refuses to override a task pinned at 0.
+#
+# The shots are math too: lm-eval defaults fewshot_config.process_docs to the
+# task-level one, so the dev split is filtered (and shuffled) the same way.
+task: mmlu_math_mc
+dataset_path: cais/mmlu
+dataset_name: all
+test_split: test
+fewshot_split: dev
+fewshot_config:
+  sampler: first_n
+process_docs: !function utils.filter_mmlu_math
+output_type: multiple_choice
+doc_to_text: !function utils.mmlu_doc_to_text
+doc_to_choice: !function utils.letter_choices
+doc_to_target: !function utils.letter_target
+num_fewshot: 2
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true

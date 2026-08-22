@@ -112,10 +112,11 @@ def main() -> int:
                         "In 'teacher' mode only the manifest is read (for n_tracks / sync layout).")
     p.add_argument("--tasks", default=DEFAULT_TASKS,
                    help="Comma-separated lm-eval task names — built-ins, or any YAML in "
-                        "--eval-task-path. The default four are the macro convention. For the "
-                        "unbiased math number use `--tasks mmlu_pro_math_mc --limit 0`: the "
-                        "limit-200 prefix of that task reads high. MMLU is opt-in via "
-                        "--include-mmlu (slow).")
+                        "--eval-task-path. The default five are the macro convention. For an "
+                        "unbiased math number use `--tasks mmlu_math_mc,mmlu_cs_mc --limit 0`: "
+                        "cs is the subject-matched control, so read the two together. "
+                        "mmlu_pro_math_mc is the old (10-way) math task, off-macro but still "
+                        "scorable by name. Full MMLU is opt-in via --include-mmlu (slow).")
     p.add_argument("--eval-task-path", default=EVAL_TASK_PATH,
                    help="Directory of extra lm-eval task YAMLs (default: the repo's "
                         "configs/eval_tasks). Must match the trainer's --eval-task-path, or a "

@@ -75,18 +75,37 @@ MMLU_CS_SUBJECTS = frozenset({
 })  # 412 test docs
 
 
+SHUFFLE_SEED = 1234
+
+
+def shuffled(dataset):
+    """Fixed-seed shuffle — the `process_docs` every task in the macro needs.
+
+    The shuffle is load-bearing, not cosmetic. lm-eval's ``--limit`` / the trainer's
+    ``--eval-limit`` take an ordered PREFIX of the docs (``instances[:limit]`` in
+    ``lm_eval/api/task.py``), NOT a random sample, so an unshuffled limit-N scores
+    whatever the dataset happens to ship first. Measured cost of leaving it off:
+    arc_easy's prefix is systematically hard, and its limit-200 accuracy ran
+    **0.063 BELOW** its full-set value on the teacher, 0.066 below on a trained
+    student — 2x the nominal sigma, and in the same direction for every model, so it
+    does not cancel in a model-vs-model comparison the way noise would.
+
+    The seed is fixed, so the prefix is the same sample on every run and at every
+    step (arms stay comparable, and the in-loop curve is not resampled per eval).
+    ``--limit 0`` scores the same docs either way — accuracy is a mean, so order
+    cannot change it.
+    """
+    return dataset.shuffle(seed=SHUFFLE_SEED)
+
+
 def _subject_slice(dataset, subjects):
     """Docs in ``subjects`` only, in a fixed shuffled order.
 
-    The shuffle is load-bearing, not cosmetic. lm-eval's ``--limit`` / the
-    trainer's ``--eval-limit`` take an ordered PREFIX of the docs, and cais/mmlu
-    ships its test split sorted by subject — so an unshuffled limit-200 of the math
-    slice would score abstract_algebra + college_mathematics and nothing else,
-    missing all 864 elementary/high-school docs. The seed is fixed, so the prefix is
-    the same sample on every run and at every step, and ``--limit 0`` scores the
-    same docs either way.
+    cais/mmlu ships its test split sorted by subject, so an unshuffled limit-200 of
+    the math slice would score abstract_algebra + college_mathematics and nothing
+    else, missing all 864 elementary/high-school docs. See ``shuffled``.
     """
-    return dataset.filter(lambda doc: doc["subject"] in subjects).shuffle(seed=1234)
+    return shuffled(dataset.filter(lambda doc: doc["subject"] in subjects))
 
 
 def filter_mmlu_math(dataset):

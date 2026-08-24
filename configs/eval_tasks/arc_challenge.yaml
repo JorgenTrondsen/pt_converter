@@ -1,0 +1,8 @@
+# lm-eval's built-in `arc_challenge`, overridden for the same reason as arc_easy —
+# and written the same way the built-in is, as a two-line delta over arc_easy, so the
+# `process_docs` shuffle is inherited rather than restated.
+#
+# The `include` resolves against THIS directory, so it picks up our arc_easy.yaml.
+include: arc_easy.yaml
+task: arc_challenge
+dataset_name: ARC-Challenge

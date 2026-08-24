@@ -47,7 +47,14 @@ def _yamls():
 
 
 def _read(path) -> dict:
-    return yaml.load(path.read_text(), Loader=_TaskLoader)
+    """The YAML with its ``include:`` chain resolved, child keys winning — lm-eval's
+    own semantics, and what lets arc_challenge be a two-line delta over arc_easy."""
+    cfg = yaml.load(path.read_text(), Loader=_TaskLoader)
+    if (included := cfg.pop("include", None)) is not None:
+        base = _read(path.parent / included)
+        base.update(cfg)
+        return base
+    return cfg
 
 
 # ----- the YAMLs -----
@@ -59,11 +66,23 @@ def test_task_dir_resolves_off_the_package(monkeypatch, tmp_path):
     assert _yamls()
 
 
-def test_shipped_yamls_cover_the_non_builtin_default_tasks():
+def test_every_default_task_is_shipped_here():
+    """Since 2026-08-23 arc_easy/arc_challenge ARE redefined locally (they were not
+    before): every task in the macro has to carry the fixed-seed shuffle, and the only
+    way to attach one to a built-in is to override it off `include_path`."""
     shipped = {_read(p)["task"] for p in _yamls()}
-    assert {"mmlu_math_mc", "codemmlu_fim"} <= shipped
-    # arc_* are lm-eval built-ins and deliberately NOT redefined here.
-    assert shipped.isdisjoint({"arc_easy", "arc_challenge"})
+    assert set(DEFAULT_TASKS.split(",")) <= shipped
+
+
+@pytest.mark.parametrize("task_name", DEFAULT_TASKS.split(","))
+def test_every_default_task_shuffles_its_docs(task_name):
+    """`--limit N` takes an ordered PREFIX, so a task without `process_docs` is scored
+    on whatever its dataset ships first. That cost arc_easy 0.063 of accuracy at
+    limit-200 vs its full set, in the SAME direction for teacher and student — a bias,
+    not noise, so it does not cancel in a model-vs-model comparison."""
+    cfg = next(_read(p) for p in _yamls() if _read(p)["task"] == task_name)
+    assert cfg.get("process_docs", "").endswith(("shuffled", "filter_mmlu_math",
+                                                 "filter_mmlu_cs"))
 
 
 @pytest.mark.parametrize("path", _yamls(), ids=lambda p: p.stem)
@@ -72,7 +91,12 @@ def test_every_task_is_loglikelihood_shaped(path):
     first request, which is why the built-in mmlu_pro_math is not usable here."""
     cfg = _read(path)
     assert cfg["output_type"] in {"multiple_choice", "loglikelihood"}
-    assert [m["metric"] for m in cfg["metric_list"]] == ["acc"]
+    # `acc` must be there because that is the only metric `downstream._acc` reads.
+    # Extra metrics are allowed: the arc built-ins also emit `acc_norm`, which costs
+    # no additional forward (same loglikelihoods, different normalization) and which
+    # macro_metrics deliberately ignores.
+    metrics = [m["metric"] for m in cfg["metric_list"]]
+    assert "acc" in metrics
     assert path.stem == cfg["task"]  # include_path resolves by filename
 
 
@@ -195,3 +219,29 @@ def test_default_tasks_all_resolve_through_the_include_path():
     available = set(lm_eval_tasks.TaskManager(include_path=EVAL_TASK_PATH).all_tasks)
     missing = [t for t in DEFAULT_TASKS.split(",") if t not in available]
     assert not missing, f"DEFAULT_TASKS unresolvable: {missing}"
+
+
+@pytest.mark.parametrize("task_name", ["arc_easy", "arc_challenge"])
+def test_our_arc_override_beats_the_lm_eval_builtin(task_name):
+    """We rely on include_path taking precedence over lm-eval's own task defaults
+    ("later paths can override earlier", lm_eval/tasks/manager.py). If a future
+    lm-eval flips that, our shuffle silently stops applying and every in-loop arc
+    number goes quietly back to being prefix-biased — so pin it."""
+    tasks = pytest.importorskip("lm_eval.tasks")
+    task = tasks.TaskManager(include_path=EVAL_TASK_PATH).load(task_name)["tasks"][task_name]
+    assert task.config.process_docs is not None, (
+        f"{task_name} resolved to lm-eval's built-in, not ours — the shuffle is not applied"
+    )
+
+
+def test_shuffled_reorders_without_changing_content():
+    """`shuffled` is subset-SELECTION only: --limit N sees different docs, --limit 0
+    sees the same set (accuracy is a mean, so order cannot move it)."""
+    class _Stub(list):
+        def shuffle(self, seed):
+            return _Stub(sorted(self, key=lambda d: (d["i"] * 7919 + seed) % 101))
+
+    docs = _Stub({"i": i} for i in range(50))
+    out = utils.shuffled(docs)
+    assert sorted(d["i"] for d in out) == sorted(d["i"] for d in docs)  # same content
+    assert [d["i"] for d in out] != [d["i"] for d in docs]              # different order

@@ -1,0 +1,39 @@
+# lm-eval's built-in `arc_easy`, OVERRIDDEN here to add the fixed-seed shuffle.
+#
+# Identical to `lm_eval/tasks/arc/arc_easy.yaml` except for two things:
+#
+#   1. `process_docs: !function utils.shuffled` — the whole point. `--limit N` takes
+#      an ordered PREFIX, and ai2_arc's test split ships in an order whose first 200
+#      docs are systematically HARDER than the set: the teacher scored 0.780 at
+#      limit-200 against 0.8426 on the full set, and a trained student 0.7650 against
+#      0.8262. Same sign for every model, ~2x the nominal sigma, so it does NOT
+#      cancel in a model-vs-model comparison. `--limit 0` is unaffected.
+#   2. `tag: ai2_arc` is dropped — we never score the group, and a tag on an
+#      overriding task is extra surface for lm-eval's cross-group duplicate check.
+#
+# Registering this name from `include_path` overrides the built-in: lm-eval processes
+# its defaults first and include_path second, "later paths can override earlier"
+# (`lm_eval/tasks/manager.py`). `tests/test_eval_tasks.py` asserts OURS is the one
+# that resolves, so a future lm-eval version that changes the precedence is caught.
+task: arc_easy
+dataset_path: allenai/ai2_arc
+dataset_name: ARC-Easy
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+test_split: test
+process_docs: !function utils.shuffled
+doc_to_text: "Question: {{question}}\nAnswer:"
+doc_to_target: "{{choices.label.index(answerKey)}}"
+doc_to_choice: "{{choices.text}}"
+should_decontaminate: true
+doc_to_decontamination_query: "Question: {{question}}\nAnswer:"
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: acc_norm
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

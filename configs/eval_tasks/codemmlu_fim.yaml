@@ -3,10 +3,15 @@
 #
 # num_fewshot is pinned to 0 HERE, and a YAML-level num_fewshot cannot be overridden
 # by --num-fewshot on the command line. The shots would be whole code files.
+#
+# process_docs is the fixed-seed shuffle every task in the macro carries: `--limit N`
+# takes an ordered PREFIX, so an unshuffled limit-200 scores whatever the parquet
+# happens to ship first rather than a sample of the 2129. See `utils.shuffled`.
 task: codemmlu_fim
 dataset_path: Fsoft-AIC/CodeMMLU
 dataset_name: fill_in_the_middle
 test_split: test
+process_docs: !function utils.shuffled
 output_type: multiple_choice
 doc_to_text: !function utils.codemmlu_doc_to_text
 doc_to_choice: !function utils.letter_choices

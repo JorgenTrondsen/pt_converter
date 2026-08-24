@@ -3,7 +3,7 @@
 The post-attn (lever B) and exact sync schedules place a boundary INSIDE the
 layer — after the token mixer's residual add, before the MLP — so the walk
 must drive the two halves separately. Canonical home shared by the training
-forward (`pt_model._run_post_attn_stack`) and the distill TF block loop.
+forward (`pt_model._run_stack`) and the distill TF block loop.
 Ported from the pre-parallm-pivot `cross_head_estimator` module (the seam
 split itself was rail-validated there; the estimator machinery was not).
 """

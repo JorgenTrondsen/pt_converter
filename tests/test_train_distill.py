@@ -480,3 +480,123 @@ def test_block_split_reconstructs_relmse_and_isolates_the_two_failures():
     assert 0.5 * rel < approx < 2.0 * rel, (
         f"split and relMSE disagree by more than 2x: {approx:.4f} vs {rel:.4f}"
     )
+
+
+def test_post_mlp_supervises_every_boundary_not_just_the_last_layer():
+    """The mis-supervision regression: derive the targets from the BOUNDARY LIST and
+    an empty attention set yields ONE target (at the final layer) instead of L.
+
+    `capture_sets` now takes the two sets `sync_sets()` resolved, so a post-mlp
+    schedule is supervised post-MLP at every boundary — and the TF loop taps the
+    same depths, because it reads the same sets.
+    """
+    from parallm.train.distill import capture_sets
+
+    L = 8
+    cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=list(range(L)), n_layers=L)
+    pt.set_sync_phase("post-mlp")
+    pt.train()
+
+    cap_attn, cap_mlp = capture_sets(*pt.sync_sets(), L)
+    assert cap_attn == set()
+    assert cap_mlp == set(range(L)), f"got {sorted(cap_mlp)}"
+
+    teacher_pt = PTWrappedModel(
+        text_config=cfg, n_tracks=4, local_track_ids=tuple(range(4)),
+        sync_after_layers=list(range(L)), track_group=None,
+    )
+    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    teacher = freeze_slice_teacher(teacher_pt)
+
+    losses = distill_step(pt, teacher, pt.lm_head, _batch(cfg),
+                          DistillConfig(sync_layer_indices=tuple(range(L))))
+    # One tap per boundary, not one for the whole stack.
+    assert sorted(losses["layer_relmse"]) == list(range(L)), losses["layer_relmse"]
+    assert torch.isfinite(losses["total"])
+    assert losses["block_mse"].item() > 0
+    for k, tm in enumerate(pt.text_models):
+        got = sum(1 for p_ in tm.layers.parameters()
+                  if p_.grad is not None and p_.grad.abs().sum() > 0)
+        assert got > 0, f"track {k}: no grad at post-mlp"
+
+
+def test_post_mlp_block_loop_taps_the_forward_it_deploys():
+    """The TF loop and the model walk must agree on what a post-mlp boundary state
+    IS. With student == teacher slices at N=1 the SyncBoundary is a no-op, so every
+    tap has to land on its own target and block_mse collapses to ~0 — the same rail
+    post-attn has, at the phase that used to have no trainer at all."""
+    L = 8
+    cfg, _dense, tracks, pt = _build(n_tracks=1, sync_after=list(range(L)), n_layers=L)
+    pt.set_sync_phase("post-mlp")
+    pt.train()
+    teacher_pt = PTWrappedModel(
+        text_config=cfg, n_tracks=1, local_track_ids=(0,),
+        sync_after_layers=list(range(L)), track_group=None,
+    )
+    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    teacher = freeze_slice_teacher(teacher_pt)
+
+    losses = distill_step(pt, teacher, pt.lm_head, _batch(cfg),
+                          DistillConfig(sync_layer_indices=tuple(range(L)), lambda_ce=0.0))
+    assert losses["block_mse"].item() < 1e-8, losses["layer_relmse"]
+
+
+def test_block_walk_fr_carries_the_students_own_state_detached():
+    """`--block-walk fr` hands each window the residual it will really get.
+
+    The tf carry is the teacher's target `t_l`; the fr carry is the student's own
+    synced output. Both are detached, which is what keeps `_flush`'s per-segment
+    backward — and the peak memory — identical between the two walks.
+    """
+    L = 8
+    cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=list(range(L)), n_layers=L)
+    pt.set_sync_phase("post-attn")
+    pt.train()
+    teacher_pt = PTWrappedModel(
+        text_config=cfg, n_tracks=4, local_track_ids=tuple(range(4)),
+        sync_after_layers=list(range(L)), track_group=None,
+    )
+    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    teacher = freeze_slice_teacher(teacher_pt)
+
+    kw = dict(sync_layer_indices=tuple(range(L)), lambda_ce=0.0)
+    tf_out = distill_step(pt, teacher, pt.lm_head, _batch(cfg), DistillConfig(**kw))
+    pt.zero_grad(set_to_none=True)
+    fr_out = distill_step(pt, teacher, pt.lm_head, _batch(cfg),
+                          DistillConfig(**kw, block_walk="fr"))
+
+    # Same targets, different inputs => a different loss. If these matched, the flag
+    # would be doing nothing.
+    assert fr_out["block_mse"].item() != tf_out["block_mse"].item()
+    # The student's own trajectory is WORSE than the teacher's, so every layer past
+    # the first is handed a drifted input and the free-running loss must be larger.
+    assert fr_out["block_mse"].item() > tf_out["block_mse"].item()
+    # Both walks still supervise every boundary.
+    assert sorted(fr_out["layer_relmse"]) == sorted(tf_out["layer_relmse"]) == list(range(L))
+    # Gradients still reach every track through the fr walk.
+    for k, tm in enumerate(pt.text_models):
+        got = sum(1 for p_ in tm.layers.parameters()
+                  if p_.grad is not None and p_.grad.abs().sum() > 0)
+        assert got > 0, f"track {k}: no grad under block_walk=fr"
+
+
+def test_block_walk_fr_is_identity_when_the_student_is_the_teacher():
+    """At N=1 with student slices == teacher slices the SyncBoundary is a no-op, so
+    the student's own trajectory IS the teacher's — the two walks must coincide and
+    both read ~0. A carry wired to the wrong tensor breaks this immediately."""
+    L = 8
+    cfg, _dense, tracks, pt = _build(n_tracks=1, sync_after=list(range(L)), n_layers=L)
+    pt.set_sync_phase("post-attn")
+    pt.train()
+    teacher_pt = PTWrappedModel(
+        text_config=cfg, n_tracks=1, local_track_ids=(0,),
+        sync_after_layers=list(range(L)), track_group=None,
+    )
+    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    teacher = freeze_slice_teacher(teacher_pt)
+
+    kw = dict(sync_layer_indices=tuple(range(L)), lambda_ce=0.0)
+    for walk in ("tf", "fr"):
+        out = distill_step(pt, teacher, pt.lm_head, _batch(cfg),
+                           DistillConfig(**kw, block_walk=walk))
+        assert out["block_mse"].item() < 1e-8, f"{walk}: {out['layer_relmse']}"

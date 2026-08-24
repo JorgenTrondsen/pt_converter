@@ -48,7 +48,7 @@ def test_streamed_teacher_matches_resident():
     at the end of a pass and has to be re-acquired for the next one."""
     cfg, _dense, tracks, _pt = _build(n_tracks=4, sync_after=list(range(N_LAYERS)))
     batch = _batch(cfg)
-    pa, pm = capture_sets(tuple(range(N_LAYERS)), N_LAYERS)
+    pa, pm = capture_sets(set(range(N_LAYERS)), {N_LAYERS - 1}, N_LAYERS)
 
     resident = _teacher(cfg, tracks)
     h_ref, caps_ref = teacher_forward(resident, batch["input_ids"], batch["attention_mask"], pa, pm)
@@ -131,11 +131,17 @@ def test_max_segment_layers_picks_the_tf_checkpoint_policy():
         9: [0, 1, 5, 9, 14, L - 1],        # uneven: the LONGEST stretch is what binds
     }
     for want, sched in cases.items():
-        sync_attn, _ = capture_sets(sched, L)
-        got = _max_segment_layers(sync_attn, L)
-        assert got == want, f"schedule {sched[:4]}...: max segment {got}, want {want}"
-        # The policy this feeds: hold short segments, checkpoint long ones.
-        assert (got > TF_CKPT_MIN_SEGMENT) == (want > 2)
+        # The loop flushes at every sync of EITHER phase, so the segment lengths are
+        # a property of the schedule alone: post-attn (boundaries + the head's
+        # post-MLP sync) and post-mlp (the same boundaries, MLP-side) agree.
+        for attn_set, mlp_set in (
+            (set(sched), {L - 1}),          # post-attn
+            (set(), set(sched) | {L - 1}),  # post-mlp
+        ):
+            got = _max_segment_layers(attn_set | mlp_set, L)
+            assert got == want, f"schedule {sched[:4]}...: max segment {got}, want {want}"
+            # The policy this feeds: hold short segments, checkpoint long ones.
+            assert (got > TF_CKPT_MIN_SEGMENT) == (want > 2)
 
 
 def test_tf_checkpointing_is_numerically_inert():

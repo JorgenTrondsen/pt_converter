@@ -181,8 +181,8 @@ class PTWrappedModel(nn.Module):
         else:
             self.lm_head = None
 
-        # Sync placement phase (see `set_sync_phase`). "post-mlp" = the legacy
-        # after-layer boundary walk, bit-identical to the original forward.
+        # Sync placement phase (see `set_sync_phase` / `sync_sets`). "post-mlp" =
+        # sync after every boundary layer's MLP, the whole layer run own-carry.
         self.sync_phase = "post-mlp"
         # Optional HostResidentLayers: when set, the walk pages each decoder
         # layer in from pinned host DRAM and drops it again (the streamed
@@ -276,13 +276,8 @@ class PTWrappedModel(nn.Module):
         )
 
     def set_sync_phase(self, phase: str) -> None:
-        """Sync placement. ``"post-mlp"`` (default): the legacy after-layer
-        boundary walk. ``"post-attn"`` (lever B): the one per-window sync lands
-        after the boundary layer's token mixer (its MLP reads the TRUE
-        residual); the final layer keeps a post-MLP sync for the head; the d1b
-        schedule = every layer a boundary. ``"exact"``: sync after attention
-        AND after MLP of every layer — bit-identical to the dense forward by
-        construction (2 syncs/layer; the frozen-slice teacher's schedule)."""
+        """Sync placement. A phase name is only a shorthand for the two sync sets
+        `sync_sets` resolves it to; one walk serves all three (see that method)."""
         if phase not in ("post-mlp", "post-attn", "exact"):
             raise ValueError(f"sync_phase must be 'post-mlp', 'post-attn' or 'exact', got {phase!r}")
         self.sync_phase = phase
@@ -290,6 +285,38 @@ class PTWrappedModel(nn.Module):
         # deltas and the cross-rank fuse is a semantic no-op — pure collective cost.
         # This is what keeps the frozen-slice teacher (pinned to `exact`) free.
         self.sync_module.cross_rank_enabled = phase != "exact"
+
+    def sync_sets(self) -> tuple[set[int], set[int]]:
+        """``(post-attn sync layers, post-MLP sync layers)`` for the active phase.
+
+        The phase does not pick a WALK, it picks two SETS — one loop serves all
+        three, so the model walk and the trainer's teacher-forced block loop cannot
+        drift on the schedule (they both read this):
+
+        | phase      | post-attn         | post-MLP            | all-reduces (d1b) |
+        |------------|-------------------|---------------------|-------------------|
+        | post-attn  | boundaries        | {last}              | L + 1             |
+        | post-mlp   | {}                | boundaries ∪ {last} | L                 |
+        | exact      | every layer       | every layer         | 2L                |
+
+        ``post-attn`` is lever B: the sync lands after the boundary layer's token
+        mixer, so that layer's MLP reads the TRUE residual and its delta is then
+        carried un-summed. ``post-mlp`` is SPD's placement — the attention sync is
+        the one dropped, and a whole layer runs own-carry between boundaries.
+        ``exact`` is the dense forward up to fp summation order (the frozen-slice
+        teacher's schedule).
+
+        ``last`` is always in the post-MLP set: the head needs a synced state to
+        project, so a schedule that names no boundary there still gets one.
+        """
+        L = len(self.text_models[0].layers)
+        last = L - 1
+        if self.sync_phase == "exact":
+            return set(range(L)), set(range(L))
+        boundaries = set(self.sync_after_layers)
+        if self.sync_phase == "post-mlp":
+            return set(), boundaries | {last}
+        return boundaries, {last}
 
     def forward(
         self,
@@ -321,57 +348,20 @@ class PTWrappedModel(nn.Module):
         # sync at each configured boundary (recombining the per-track partial
         # residual updates). Optional mid-window taps reconstruct a synced hidden
         # at non-boundary depths for loss/metric purposes only (never fed forward).
-        sync_set = set(self.sync_after_layers)
         sync_hiddens: dict[int, torch.Tensor] | None = (
             {} if (return_sync_hiddens or return_intra_window_hiddens) else None
         )
-        if self.sync_phase in ("post-attn", "exact"):
-            h = self._run_post_attn_stack(
-                h,
-                position_embeddings,
-                text_position_ids,
-                layer_masks,
-                sync_hiddens=sync_hiddens,
-                exact=self.sync_phase == "exact",
-                capture_post_attn=capture_post_attn,
-                capture_post_mlp=capture_post_mlp,
-                probe_capture=probe_capture,
-            )
-        else:
-            if (self.sync_module.fuse_size > 1 or self.exec_groups > 1
-                    or self.sync_module.fuse_ranks > 1):
-                # The post-mlp walk never calls `fuse`, so every grouping mechanism
-                # is silently inert here. Reporting a fused number for an unfused
-                # run is the failure mode; nothing trains on post-mlp, so refuse.
-                raise ValueError(
-                    "fuse_size/exec_groups/fuse_ranks > 1 are implemented for "
-                    "post-attn/exact only"
-                )
-            block_start = h
-            per_track_h = [h for _ in self.text_models]
-            for layer_idx in range(len(tm0.layers)):
-                new_h: list[torch.Tensor] = []
-                for k, tm in enumerate(self.text_models):
-                    mask = layer_masks[tm.config.layer_types[layer_idx]]
-                    new_h.append(
-                        tm.layers[layer_idx](
-                            per_track_h[k],
-                            position_embeddings=position_embeddings,
-                            attention_mask=mask,
-                            position_ids=text_position_ids,
-                            past_key_values=None,
-                            use_cache=False,
-                        )
-                    )
-                per_track_h = new_h
-                if layer_idx in sync_set:
-                    h = self.sync_module(per_track_h, block_start)
-                    if sync_hiddens is not None:
-                        sync_hiddens[layer_idx] = h
-                    block_start = h
-                    per_track_h = [h for _ in self.text_models]
-                elif return_intra_window_hiddens:
-                    sync_hiddens[layer_idx] = self.sync_module(per_track_h, block_start)
+        h = self._run_stack(
+            h,
+            position_embeddings,
+            text_position_ids,
+            layer_masks,
+            sync_hiddens=sync_hiddens,
+            capture_post_attn=capture_post_attn,
+            capture_post_mlp=capture_post_mlp,
+            intra_window=return_intra_window_hiddens,
+            probe_capture=probe_capture,
+        )
 
         h = tm0.norm(h)
         if return_hidden_pre_lm_head:
@@ -384,44 +374,44 @@ class PTWrappedModel(nn.Module):
         logits = self.lm_head(h) if self.lm_head is not None else None
         return logits, sync_hiddens
 
-    def _run_post_attn_stack(
+    def _run_stack(
         self,
         h: torch.Tensor,
         position_embeddings,
         text_position_ids,
         layer_masks: dict,
         sync_hiddens: "dict[int, torch.Tensor] | None" = None,
-        exact: bool = False,
         capture_post_attn: "set[int] | None" = None,
         capture_post_mlp: "set[int] | None" = None,
+        intra_window: bool = False,
         probe_capture: "dict | None" = None,
     ) -> torch.Tensor:
-        """Phase-shifted sync walk — lever B (``exact=False``) and the exact
-        schedule (``exact=True``).
+        """The sync walk, driven by the two sets `sync_sets` resolves — ONE loop for
+        every phase.
 
-        Lever B: the one fresh all-reduce per sync window lands POST-ATTENTION
-        at every boundary in ``self.sync_after_layers`` (that boundary layer's MLP
-        reads the FULL synced residual and its delta is then CARRIED un-summed),
-        and non-boundary layers run fully partial. The all-reduce sums every
-        per-track delta accrued since the previous sync, so each delta is summed
-        exactly once. Reduces to the d1b per-layer loop when every layer is a
-        boundary.
+        A layer in the post-attn set syncs after its token mixer, so that layer's MLP
+        reads the FULL synced residual (lever B) and its delta is then carried
+        un-summed. A layer in the post-MLP set syncs after its MLP. A layer in
+        neither runs fully own-carry. Every all-reduce sums the per-track deltas
+        accrued since the previous one, so each delta is summed exactly once.
 
-        **The FINAL layer is a full boundary — post-attn AND post-MLP** (one extra
-        all-reduce, 64 -> 65 at d1b). Excluding it, as this walk used to, left the
-        last window feeding its MLP a residual missing TWO un-synced sublayers
-        instead of one, in the window that sets the logits: +0.2157 math to repair.
-        A schedule omitting the last layer still works — it falls to the own-carry
-        branch, which syncs post-MLP for the norm.
-
-        Exact: sync after attention AND after MLP of every layer — every
-        sublayer reads the true residual, so the walk is the dense forward up
-        to fp summation order (the frozen-slice teacher path; 2 syncs/layer).
+        **``last`` is always in the post-MLP set** — the head needs a synced state.
+        At post-attn that makes the final layer a FULL boundary (post-attn AND
+        post-MLP, one extra all-reduce, 64 -> 65 at d1b): excluding it, as this walk
+        used to, left the last window feeding its MLP a residual missing TWO
+        un-synced sublayers instead of one, in the window that sets the logits —
+        +0.2157 math to repair.
 
         ``capture_post_attn`` / ``capture_post_mlp``: layer sets whose post-attn
         (resp. post-MLP) synced state is stored into ``sync_hiddens`` — the
         teacher-target contract (a boundary target is post-attn, a final /
         mid-window target is post-MLP; a layer never needs both).
+
+        ``intra_window``: also reconstruct a synced post-MLP state at ``tap_mlp``
+        layers that sync at NEITHER phase. Loss-only — never fed forward — so
+        observing costs an all-reduce and changes nothing that is carried. It is
+        gated on the capture set like every other tap: one contract, so passing no
+        sets records nothing rather than half a dict.
 
         ``probe_capture``: a SEPARATE ``{(layer, phase): hidden}`` dict for the
         activation probe, which needs BOTH phases at EVERY layer. It cannot share
@@ -435,16 +425,27 @@ class PTWrappedModel(nn.Module):
 
         L = len(self.text_models[0].layers)
         last = L - 1
-        sync_attn_set = set(range(L)) if exact else set(self.sync_after_layers)
+        sync_attn_set, sync_mlp_set = self.sync_sets()
+        assert last in sync_mlp_set, "the head needs a synced state at the final layer"
         if sync_hiddens is None:
             tap_attn = tap_mlp = ()
+        elif capture_post_attn is None and capture_post_mlp is None:
+            # No explicit contract: report every state the walk actually syncs, plus
+            # the mid-window reconstructions when asked. post-MLP wins where a layer
+            # syncs at both (only `exact`), which is the plain reading of "the synced
+            # hidden after layer i". Callers that need a SPECIFIC phase per layer —
+            # the teacher-target contract — pass the sets and get exactly them.
+            tap_attn = sync_attn_set
+            tap_mlp = set(sync_mlp_set)
+            if intra_window:
+                tap_mlp |= set(range(L)) - sync_attn_set
         else:
             tap_attn, tap_mlp = capture_post_attn or (), capture_post_mlp or ()
         if self.exec_groups > 1:
             return self._run_batched_stack(
                 h, position_embeddings, text_position_ids, layer_masks,
-                L, last, sync_attn_set, sync_hiddens,
-                tap_attn, tap_mlp, exact, probe_capture,
+                L, last, sync_attn_set, sync_mlp_set, sync_hiddens,
+                tap_attn, tap_mlp, intra_window, probe_capture,
             )
         if probe_capture is not None:
             probe_capture[(-1, "mlp")] = h
@@ -471,8 +472,8 @@ class PTWrappedModel(nn.Module):
                 per_track_h,
             )
             if i in sync_attn_set:
-                # Boundary: post-attention sync delivers the real cross-track
-                # content to this layer's MLP.
+                # Post-attention sync delivers the real cross-track content to
+                # this layer's MLP.
                 R = self.sync_module(self.sync_module.leaders(h_attn), block_start)
                 if i in tap_attn:
                     sync_hiddens[i] = R
@@ -483,51 +484,39 @@ class PTWrappedModel(nn.Module):
                 new_h = self.sync_module.fuse(
                     [run_mlp(tm.layers[i], R) for tm in self.text_models], pre
                 )
-                if exact:
-                    # Second sync of the exact schedule: post-MLP, every layer.
-                    Hm = self.sync_module(self.sync_module.leaders(new_h), R)
-                    if i in tap_mlp:
-                        sync_hiddens[i] = Hm
-                    if probe_capture is not None:
-                        probe_capture[(i, "mlp")] = Hm
-                    if i == last:
-                        h = Hm
-                    block_start = Hm
-                    per_track_h = [Hm for _ in self.text_models]
-                elif i == last:
-                    # The head's post-MLP sync. Pre-state is R, not block_start: this
-                    # MLP's input WAS the synced residual, so its delta is all there is.
-                    h = self.sync_module(self.sync_module.leaders(new_h), R)
-                    if i in tap_mlp:
-                        sync_hiddens[i] = h
-                    if probe_capture is not None:
-                        probe_capture[(i, "mlp")] = h
-                else:
-                    per_track_h = new_h
+                # Pre-state is R, not block_start: this MLP's input WAS the synced
+                # residual, so its delta is all there is to sum.
+                mlp_pre = R
             else:
-                # Own-carry (non-boundary) OR the final layer's post-MLP sync.
                 new_h = self.sync_module.fuse(
                     [run_mlp(tm.layers[i], h_attn[k]) for k, tm in enumerate(self.text_models)],
                     h_attn,
                 )
-                if i == last:
-                    h = self.sync_module(self.sync_module.leaders(new_h), block_start)
-                    if i in tap_mlp:
-                        sync_hiddens[i] = h
-                    if probe_capture is not None:
-                        probe_capture[(i, "mlp")] = h
-                else:
-                    per_track_h = new_h
+                mlp_pre = block_start
+            if i in sync_mlp_set:
+                Hm = self.sync_module(self.sync_module.leaders(new_h), mlp_pre)
+                if i in tap_mlp:
+                    sync_hiddens[i] = Hm
+                if probe_capture is not None:
+                    probe_capture[(i, "mlp")] = Hm
+                h = Hm
+                block_start = Hm
+                per_track_h = [Hm for _ in self.text_models]
+            else:
+                if intra_window and i in tap_mlp:
+                    sync_hiddens[i] = self.sync_module(
+                        self.sync_module.leaders(new_h), mlp_pre)
+                per_track_h = new_h
             if self.layer_stream is not None:
                 self.layer_stream.release(i)
         return h
 
     def _run_batched_stack(
         self, h, position_embeddings, text_position_ids, layer_masks,
-        L, last, sync_attn_set, sync_hiddens,
-        tap_attn, tap_mlp, exact, probe_capture=None,
+        L, last, sync_attn_set, sync_mlp_set, sync_hiddens,
+        tap_attn, tap_mlp, intra_window, probe_capture=None,
     ) -> torch.Tensor:
-        """`_run_post_attn_stack` for a merged track run as G members.
+        """`_run_stack` for a merged track run as G members.
 
         Same schedule, same boundary semantics — the G members' states live in one
         ``[G, B, T, H]`` tensor instead of a per-track list, so the rank-local
@@ -561,34 +550,23 @@ class PTWrappedModel(nn.Module):
                     probe_capture[(i, "attn")] = R
                 block_start = R
                 new_h = run_mlp(i, R)
-                if exact:
-                    Hm = self.sync_module(new_h, R, stacked=True)
-                    if i in tap_mlp:
-                        sync_hiddens[i] = Hm
-                    if probe_capture is not None:
-                        probe_capture[(i, "mlp")] = Hm
-                    if i == last:
-                        h = Hm
-                    block_start = Hm
-                    carry = Hm
-                elif i == last:
-                    h = self.sync_module(new_h, R, stacked=True)
-                    if i in tap_mlp:
-                        sync_hiddens[i] = h
-                    if probe_capture is not None:
-                        probe_capture[(i, "mlp")] = h
-                else:
-                    carry = new_h
+                mlp_pre = R
             else:
                 new_h = run_mlp(i, h_attn)
-                if i == last:
-                    h = self.sync_module(new_h, block_start, stacked=True)
-                    if i in tap_mlp:
-                        sync_hiddens[i] = h
-                    if probe_capture is not None:
-                        probe_capture[(i, "mlp")] = h
-                else:
-                    carry = new_h
+                mlp_pre = block_start
+            if i in sync_mlp_set:
+                Hm = self.sync_module(new_h, mlp_pre, stacked=True)
+                if i in tap_mlp:
+                    sync_hiddens[i] = Hm
+                if probe_capture is not None:
+                    probe_capture[(i, "mlp")] = Hm
+                h = Hm
+                block_start = Hm
+                carry = Hm
+            else:
+                if intra_window and i in tap_mlp:
+                    sync_hiddens[i] = self.sync_module(new_h, mlp_pre, stacked=True)
+                carry = new_h
             if self.layer_stream is not None:
                 self.layer_stream.release(i)
         return h

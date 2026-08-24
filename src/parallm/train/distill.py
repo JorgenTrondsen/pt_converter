@@ -73,6 +73,10 @@ class DistillConfig:
     lambda_ce: float = 1.0
     lambda_mag: float | None = None
     intra_window_mse: bool = False
+    # Which trajectory the block loop CARRIES between boundaries — see the note on
+    # `distill_step`. "tf": the teacher's state (the default, and what every result
+    # on record was trained with). "fr": the student's own synced state, detached.
+    block_walk: str = "tf"
     ce_chunk_size: int = 256
     # Longest own-carry segment the TF loop holds uncheckpointed; see
     # TF_CKPT_MIN_SEGMENT. 0 restores the pre-2026-08-07 "always checkpoint at D>1"
@@ -126,19 +130,25 @@ def teacher_forward(
 
 
 def capture_sets(
-    sync_layer_indices, num_layers: int, intra_window_mse: bool = False
+    sync_attn_set, sync_mlp_set, num_layers: int, intra_window_mse: bool = False
 ) -> tuple[set[int], set[int]]:
-    """``(post_attn_layers, post_mlp_layers)`` the teacher captures: post-attn
-    residual at every boundary, post-MLP at the final layer when the schedule does
-    not make it one (plus mid-window taps under ``intra_window_mse``).
+    """``(post_attn_layers, post_mlp_layers)`` the teacher captures, for the two
+    sets a `PTWrappedModel.sync_sets()` resolved — pass them straight through:
+
+        cap_attn, cap_mlp = capture_sets(*student.sync_sets(), L)
+
+    Every layer the student syncs at gets the target for the phase it synced at, so
+    the supervision follows the schedule rather than the boundary list. Deriving it
+    from boundaries alone is how the post-mlp phase (empty attention set) once ended
+    up with ONE target at the final layer instead of L.
 
     ⚠ Never both for one layer: ``sync_hiddens`` is keyed by layer alone, so the
-    post-MLP write would silently overwrite the post-attn target."""
-    last = num_layers - 1
-    post_attn = set(sync_layer_indices)
-    post_mlp = set() if last in post_attn else {last}
+    post-MLP write would silently overwrite the post-attn target. A layer in both
+    sets (only ``exact``, which trains nothing) is supervised post-attn."""
+    post_attn = set(sync_attn_set)
+    post_mlp = set(sync_mlp_set) - post_attn
     if intra_window_mse:
-        post_mlp |= set(range(num_layers)) - post_attn - {last}
+        post_mlp |= set(range(num_layers)) - post_attn
     return post_attn, post_mlp
 
 
@@ -151,14 +161,15 @@ def capture_sets(
 TF_CKPT_MIN_SEGMENT = 2
 
 
-def _max_segment_layers(sync_attn_set: set[int], num_layers: int) -> int:
+def _max_segment_layers(sync_layers: set[int], num_layers: int) -> int:
     """Layers in the longest stretch the TF loop carries between backwards.
 
-    The loop flushes at every boundary and again at the final layer, so the live
-    graph is one segment — `[0..b0]`, `(b0..b1]`, ... `(b_last..L-1]`. At D=1 every
-    non-last layer is a boundary and every segment is 1; at D=2 they are all 2.
+    The loop flushes at every sync (either phase) and again at the final layer, so
+    the live graph is one segment — `[0..b0]`, `(b0..b1]`, ... `(b_last..L-1]`. At
+    D=1 every non-last layer is a boundary and every segment is 1; at D=2 they are
+    all 2.
     """
-    flushes = sorted(sync_attn_set | {num_layers - 1})
+    flushes = sorted(set(sync_layers) | {num_layers - 1})
     prev, longest = -1, 0
     for f in flushes:
         longest = max(longest, f - prev)
@@ -244,12 +255,25 @@ def distill_step(
     peak memory ≈ one segment); the output objective backwards once through
     the checkpointed full forward.
 
-    The block loop is fully teacher-forced. Student forcing was REMOVED
-    2026-07-30: an sf sweep at D=2/N=24/F=3 on the 27B found sf=0 / 0.25 / 0.5
-    indistinguishable (0.589-0.594, a 0.005 spread), sf=0.75 worse by 0.031, and
-    sf=1.0 divergent — a student trained with ZERO exposure to its own outputs
-    scores the same evaluated FREE-RUNNING as one trained half on them, so
-    exposure bias does not bind along the depth axis here.
+    ``cfg.block_walk`` picks what the loop CARRIES between boundaries. ``"tf"``
+    (default) carries the teacher's state at that depth — every result on record was
+    trained this way. ``"fr"`` carries the student's OWN synced state, detached, so
+    each window trains on the input distribution it will actually see at inference
+    (DAgger-style); the TARGET is the teacher either way. Detached is deliberate:
+    it keeps `_flush`'s per-segment backward, so the graph lifetime and peak memory
+    are identical to ``"tf"``. The non-detached full unroll is the pre-pivot
+    ``--lambda-fr``, which needs `retain_graph` and a whole-stack graph, and whose
+    gradient amplifies geometrically with boundary distance — do not rebuild it.
+
+    ⚠ ``"fr"`` is the old ``student_forcing`` at sf=1.0, which was REMOVED 2026-07-30
+    as "divergent" — **and that verdict is VOID.** The sf sweep ran while `block_mse`
+    carried a `clamp_max` that existed SPECIFICALLY to cap the spikes student forcing
+    causes, and `clamp` passes ZERO gradient above its max (`losses.py`). sf drives
+    the loss above the cap; above the cap the dominant term was untrainable and the
+    trajectory drifted unchecked. The clamp was not removed until 2026-08-04 — five
+    days AFTER sf was deleted — so sf was never once tested with a working gradient
+    in the regime sf itself creates. What the sweep did establish, and this does not
+    disturb, is that sf=0.25/0.5 are indistinguishable from sf=0.
 
     ``probe``: an `ActivationProbe` to score this step's per-layer / per-track
     activations against the teacher (see `train/probe.py`). Pass it only on probe
@@ -267,10 +291,14 @@ def distill_step(
     last = L - 1
     need_ce = cfg.lambda_ce != 0.0
 
-    # Teacher targets: post-attn at every boundary (the final layer included), plus
-    # mid-window post-MLP taps under --intra-window-mse.
-    sync_attn_set, post_mlp_set = capture_sets(
-        cfg.sync_layer_indices, L, cfg.intra_window_mse)
+    # Teacher targets, from the student's OWN schedule: the phase each layer syncs
+    # at decides which state is supervised there, plus mid-window post-MLP taps
+    # under --intra-window-mse. Reading `sync_sets()` rather than re-deriving from
+    # `cfg.sync_layer_indices` is what keeps this loop and the model walk from
+    # drifting apart on the schedule.
+    sync_attn_set, sync_mlp_set = student.sync_sets()
+    cap_attn_set, cap_mlp_set = capture_sets(
+        sync_attn_set, sync_mlp_set, L, cfg.intra_window_mse)
     # Only the per-boundary captures are consumed now — CE is against hard
     # labels, so the teacher's final hidden goes unused. Do NOT "clean that up"
     # by flipping teacher_forward's return_hidden_pre_lm_head to False: that
@@ -279,8 +307,8 @@ def distill_step(
     with prof.phase("teacher_fwd"):
         _, t_caps = teacher_forward(
             teacher, input_ids, attention_mask,
-            post_attn_layers=sync_attn_set, post_mlp_layers=post_mlp_set,
-            probe_capture=probe.begin(attention_mask) if probe is not None else None,
+            post_attn_layers=cap_attn_set, post_mlp_layers=cap_mlp_set,
+            probe_capture=probe.begin(attention_mask, input_ids) if probe is not None else None,
         )
     # ----- Scaffolding (embed broadcast + masks + rotary, shared by the loop) -----
     prof_scaffold = prof.phase("scaffold")
@@ -328,7 +356,7 @@ def distill_step(
     #
     # The FR forward below keeps the model's own checkpointing regardless — that one
     # holds all L layers and genuinely needs it.
-    max_seg = _max_segment_layers(sync_attn_set, L)
+    max_seg = _max_segment_layers(sync_attn_set | sync_mlp_set, L)
     use_ckpt = (
         student.use_checkpoint
         and torch.is_grad_enabled()
@@ -336,7 +364,7 @@ def distill_step(
     )
 
     # Sublayer/sync/share adapters, so ONE loop body serves both track
-    # representations — this walk and `pt_model._run_post_attn_stack` must agree
+    # representations — this walk and `pt_model._run_stack` must agree
     # sublayer for sublayer or the block targets are measured against a different
     # model, and two hand-mirrored loops is how that drifts. `mix`/`mlp` take the
     # per-sublayer INPUT as both the operand and the fuse pre-state, which every
@@ -383,45 +411,69 @@ def distill_step(
     for i in range(L):
         layer_mask = layer_masks[tm0.config.layer_types[i]]
         h_attn = mix(i, block_input, layer_mask)
-        is_boundary = i in sync_attn_set
-        supervise = is_boundary or i == last or cfg.intra_window_mse
-        if is_boundary:
+        attn_sync = i in sync_attn_set
+        mlp_sync = i in sync_mlp_set
+        new_h = None
+        if attn_sync:
             h_synced = sync(h_attn, block_start)  # post-attn, carried
         else:
             new_h = mlp(i, h_attn)
-            # Final layer: post-MLP carried sync. Non-boundary: loss-only tap
-            # (synced reconstruction; the forward keeps carrying the partial).
-            h_synced = sync(new_h, block_start) if supervise else None
+            # A post-MLP sync is carried; anything else is a loss-only tap (synced
+            # reconstruction; the forward keeps carrying the partial).
+            supervise_mlp = mlp_sync or i == last or cfg.intra_window_mse
+            h_synced = sync(new_h, block_start) if supervise_mlp else None
         if probe is not None:
-            # Scored BEFORE `_flush` backwards this segment's graph. The mixer's
-            # per-track pre-state is `block_input`, which at a boundary is the
-            # PREVIOUS layer's own-carried post-MLP — that partial input is the
-            # d1b seam, and it is what makes the post-attn row the interesting one.
+            # Scored BEFORE `_flush` backwards this segment's graph. Which row is the
+            # SEAM follows the phase, because it follows what `block_input` holds: at
+            # a post-attn boundary it is the PREVIOUS layer's own-carried post-MLP, so
+            # the post-attn row carries the seam; at a post-mlp boundary it is the
+            # teacher's exact post-MLP, so the post-attn row is the RAIL (~0) and the
+            # seam moves to the post-mlp row. See `probe.summary_lines`.
+            # `merged=None` makes the probe all-reduce the state itself, which is what
+            # gives the un-synced phase a merged row at all.
             probe.record(i, "attn", h_attn, block_input,
-                         merged=h_synced if is_boundary else None,
+                         merged=h_synced if attn_sync else None,
                          pre_shared=block_start)
-            if not is_boundary:
+            if new_h is not None:
                 probe.record(i, "mlp", new_h, h_attn,
                              merged=h_synced, pre_shared=block_start)
-        if supervise:
+        if h_synced is not None:
             t_l = t_caps.pop(i).detach()
             r = tap_loss(h_synced, t_l)
             seg_loss = seg_loss + r
             seg_count += 1
             block_loss_val = block_loss_val + r.detach()
             layer_relmse[i] = float(r.detach())
-        if is_boundary:
+        if attn_sync or mlp_sync:
             _flush(seg_loss, seg_count)
             seg_loss = torch.zeros((), device=device)
             seg_count = 0
-            block_start = t_l  # teacher-forced carry (see the sf note above)
-            block_input = mlp(i, share(t_l))
-            if probe is not None:
-                # Every track's MLP reads the SAME teacher-exact residual here, so
-                # this row's only student-side error is the MLP weights themselves —
-                # at step 0 the merged state must reproduce the teacher's post-MLP,
-                # which is the probe's alignment rail.
-                probe.record(i, "mlp", block_input, share(t_l))
+            # The carry. `t_l` (teacher-forced) hands the next window a perfect
+            # residual; `h_synced.detach()` hands it the one it will really get.
+            # Detached either way, so the segment always starts from a leaf.
+            carry = t_l if cfg.block_walk == "tf" else h_synced.detach()
+            block_start = carry
+            if attn_sync:
+                # The boundary layer's MLP reads the carried residual. Under "tf"
+                # that is teacher-exact, so this row's only student-side error is the
+                # MLP weights themselves and at step 0 the merged state must
+                # reproduce the teacher's post-MLP — the probe's alignment rail.
+                # ⚠ under "fr" the input is NOT teacher-exact and this row is no
+                # longer a rail. A post-MLP sync has already run its MLP own-carry,
+                # so there is nothing to re-run: that is the 64 MLP calls/step
+                # post-mlp does not pay.
+                block_input = mlp(i, share(carry))
+                if probe is not None:
+                    # `pre_shared=carry` is LOAD-BEARING under block_walk="fr".
+                    # `record` reduces a merged row as `pre + Σ_k(state_k − pre)`, and
+                    # defaults `pre` to the TEACHER's post-attn state. Under "tf" the
+                    # carry IS that tensor so the default is right; under "fr" it is
+                    # not, and the offset (carry − teacher) gets summed once per
+                    # track — a 64x inflation of the drift at N=64, which read as
+                    # relMSE 190-1292 and looked like a diverging model.
+                    probe.record(i, "mlp", block_input, share(carry), pre_shared=carry)
+            else:
+                block_input = share(carry)
         elif i == last:
             _flush(seg_loss, seg_count)
         else:
@@ -440,14 +492,24 @@ def distill_step(
     # frozen lm_head can still decode, and neither alone clears macro ~0.55
     # while together they reach 0.595.
     ce_val = torch.zeros((), device=device)
-    if need_ce:
+    # The probe needs this forward even with CE off: the teacher-forced loop above
+    # resets the carry to the teacher at every boundary, so it can only report each
+    # layer's OWN error, while every downstream number is free-running. Scoring only
+    # the TF walk is what made the probe blind to accumulated drift.
+    fr_caps = {} if probe is not None else None
+    if need_ce or probe is not None:
         with prof.phase("fr_forward"):
             hidden, _ = student(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_sync_hiddens=False,
                 return_hidden_pre_lm_head=True,
+                probe_capture=fr_caps,
             )
+        if probe is not None:
+            probe.record_fr(fr_caps)
+            fr_caps.clear()  # 2L (B, T, H) tensors — do not hold them past scoring
+    if need_ce:
         with prof.phase("ce_chunked"):
             ce_val, grad_h = ce_chunked(
                 hidden, lm_head, labels,

@@ -166,16 +166,14 @@ def fidelity_step(
     teacher_logits, teacher_hiddens = teacher.forward(
         input_ids, attention_mask=attention_mask
     )
-    # At post-attn/exact the student only records a hidden for layers named in
-    # the capture sets — passing neither yields an EMPTY dict and every metric
-    # lookup below KeyErrors. (The legacy post-mlp path populates unconditionally,
-    # which is why this went unnoticed: post-attn is the schedule everything
-    # actually trains at.) Reuse the trainer's own helper so fidelity taps land on
-    # exactly the depths training supervises.
+    # The student only records a hidden for layers named in the capture sets —
+    # passing neither yields an EMPTY dict and every metric lookup below KeyErrors.
+    # Reuse the trainer's own helper, fed the student's own schedule, so fidelity
+    # taps land on exactly the depths training supervises.
     from parallm.train.distill import capture_sets
 
     cap_attn, cap_mlp = capture_sets(
-        student.sync_after_layers,
+        *student.sync_sets(),
         len(student.text_models[0].layers),
         intra_window_taps,
     )

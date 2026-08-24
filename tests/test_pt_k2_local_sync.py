@@ -148,13 +148,13 @@ def test_k2_peer_rank_returns_no_logits():
 
 
 def test_post_attn_capture_sets_cover_every_metric_layer():
-    """At post-attn the student records ONLY the layers named in the capture
-    sets, so `capture_sets` and the metric layers must agree exactly.
+    """At post-attn the student records exactly the layers named in the capture
+    sets, so `capture_sets` and the metric layers must agree.
 
     eval_fidelity passed neither set and got an EMPTY dict back, KeyError-ing on
     the first layer — its per-layer block_mse never worked at post-attn at all.
-    It went unnoticed because the legacy post-mlp branch populates
-    unconditionally, and post-attn is the schedule everything actually trains at.
+    Two things fixed that: it now passes the sets, and passing NEITHER no longer
+    means "record nothing" but "record every state the walk syncs".
     """
     from parallm.train.distill import capture_sets
 
@@ -171,7 +171,7 @@ def test_post_attn_capture_sets_cover_every_metric_layer():
     input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
     attention_mask = torch.ones((1, 8), dtype=torch.long)
 
-    cap_attn, cap_mlp = capture_sets(pt.sync_after_layers, L, False)
+    cap_attn, cap_mlp = capture_sets(*pt.sync_sets(), L, False)
     with torch.no_grad():
         _, hiddens = pt(
             input_ids=input_ids,
@@ -182,23 +182,21 @@ def test_post_attn_capture_sets_cover_every_metric_layer():
         )
     assert set(hiddens) == {1, 3, 5, 7}, f"got {sorted(hiddens)}"
 
-    # Falsify: no capture sets at post-attn records nothing (the actual bug).
+    # No capture sets: every layer the walk syncs at, which at post-attn is the
+    # boundaries (post-attn state) and the final layer (post-MLP state).
     with torch.no_grad():
-        _, empty = pt(
+        _, defaulted = pt(
             input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=True
         )
-    assert empty == {}
+    assert set(defaulted) == {1, 3, 5, 7}
 
-    # ⚠ MID-WINDOW taps are NOT implemented at post-attn. capture_sets(intra=True)
-    # names every layer, but _run_post_attn_stack only records at a boundary or at
-    # `last` — there is no loss-only reconstruction branch for the depths in
-    # between, the way the legacy post-mlp path has at pt_model.py:331-332. So
-    # --intra-window-taps silently degrades to boundary-only here. Asserted so the
-    # gap is a recorded fact rather than a surprise at the next call site.
-    cap_attn, cap_mlp = capture_sets(pt.sync_after_layers, L, True)
+    # MID-WINDOW taps are implemented at every phase now: the own-carry branch
+    # reconstructs a synced post-MLP state at the depths in between. They are
+    # loss-only, so the boundary states must be untouched.
+    cap_attn, cap_mlp = capture_sets(*pt.sync_sets(), L, True)
     assert cap_attn | cap_mlp == set(range(L))
     with torch.no_grad():
-        _, partial = pt(
+        _, full = pt(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_sync_hiddens=True,
@@ -206,7 +204,9 @@ def test_post_attn_capture_sets_cover_every_metric_layer():
             capture_post_attn=cap_attn,
             capture_post_mlp=cap_mlp,
         )
-    assert set(partial) == {1, 3, 5, 7}, "mid-window at post-attn is now implemented — update this rail"
+    assert set(full) == set(range(L)), f"got {sorted(full)}"
+    for i in (1, 3, 5, 7):
+        assert torch.equal(full[i], hiddens[i]), f"L{i} perturbed by observation"
 
 
 def test_final_layer_mlp_reads_the_synced_residual():
@@ -227,7 +227,7 @@ def test_final_layer_mlp_reads_the_synced_residual():
     ).eval()
     pt.set_sync_phase("post-attn")
 
-    cap_attn, cap_mlp = capture_sets(pt.sync_after_layers, L, False)
+    cap_attn, cap_mlp = capture_sets(*pt.sync_sets(), L, False)
     assert cap_attn == set(range(L)) and cap_mlp == set()
 
     with torch.no_grad():
@@ -260,7 +260,7 @@ def test_schedule_omitting_the_last_layer_still_syncs_it_post_mlp():
         sync_after_layers=sync, track_group=None,
     ).eval()
     pt.set_sync_phase("post-attn")
-    cap_attn, cap_mlp = capture_sets(sync, L, False)
+    cap_attn, cap_mlp = capture_sets(*pt.sync_sets(), L, False)
     assert cap_attn == set(sync) and cap_mlp == {L - 1}
     with torch.no_grad():
         _, hiddens = pt(
@@ -270,3 +270,99 @@ def test_schedule_omitting_the_last_layer_still_syncs_it_post_mlp():
             capture_post_attn=cap_attn, capture_post_mlp=cap_mlp,
         )
     assert set(hiddens) == set(sync) | {L - 1}
+
+
+def test_sync_sets_maps_each_phase_to_two_sets():
+    """The phase does not pick a WALK, it picks two SETS — and `last` is always in
+    the post-MLP one, because the head needs a synced state to project."""
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    sched = [1, 3, 5, 7]
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+        sync_after_layers=sched, track_group=None,
+    ).eval()
+
+    pt.set_sync_phase("post-attn")
+    assert pt.sync_sets() == (set(sched), {L - 1})
+    pt.set_sync_phase("post-mlp")
+    assert pt.sync_sets() == (set(), set(sched))
+    pt.set_sync_phase("exact")
+    assert pt.sync_sets() == (set(range(L)), set(range(L)))
+
+    # A schedule that does not name the final layer still gets a post-MLP sync there.
+    pt2 = PTWrappedModel(
+        text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+        sync_after_layers=[1, 3, 5], track_group=None,
+    ).eval()
+    for phase in ("post-attn", "post-mlp", "exact"):
+        pt2.set_sync_phase(phase)
+        assert L - 1 in pt2.sync_sets()[1], phase
+
+
+def test_post_mlp_walk_matches_a_whole_layer_reference_loop():
+    """post-mlp = every track runs the WHOLE layer own-carry, then one all-reduce.
+
+    The unified walk reaches that by splitting each layer into mixer/MLP halves and
+    syncing on the MLP side only. That has to be the same function as calling the
+    layer whole, which is what the deleted second walk did — so this rail is the
+    reference loop written out longhand.
+    """
+    cfg = _tiny_config()
+    n_tracks = 2
+    torch.manual_seed(13)
+    dense = Qwen3_5TextModel(cfg).eval()
+    dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+    nn.init.normal_(dense.lm_head.weight, mean=0.0, std=0.02)
+
+    tracks, manifest = slice_model_to_tracks(
+        dense, n_tracks=n_tracks, sync_block_depth=4, text_config_attr="config"
+    )
+    sync_set = set(manifest.sync_layer_indices)  # [3, 7]; 7 == last
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=n_tracks, local_track_ids=(0, 1),
+        sync_after_layers=manifest.sync_layer_indices, track_group=None,
+    ).eval()
+    pt.load_track_state_dicts({0: tracks[0], 1: tracks[1]}, strict=False)
+    pt.set_sync_phase("post-mlp")
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 16))
+    attention_mask = torch.ones((1, 16), dtype=torch.long)
+
+    with torch.no_grad():
+        got, _ = pt(input_ids=input_ids, attention_mask=attention_mask)
+
+        # --- the reference: whole-layer own-carry, sync after the layer ---
+        tm0 = pt.text_models[0]
+        h = pt.embed(input_ids)
+        pos_ids, text_pos_ids = tm0._resolve_position_ids(h, None)
+        masks = pt._adapter.build_masks(tm0.config, h, attention_mask, text_pos_ids)
+        pos_emb = tm0.rotary_emb(h, pos_ids)
+
+        block_start = h
+        per_track = [h for _ in pt.text_models]
+        for i in range(cfg.num_hidden_layers):
+            per_track = [
+                tm.layers[i](
+                    per_track[k],
+                    position_embeddings=pos_emb,
+                    attention_mask=masks[tm.config.layer_types[i]],
+                    position_ids=text_pos_ids,
+                    past_key_values=None,
+                    use_cache=False,
+                )
+                for k, tm in enumerate(pt.text_models)
+            ]
+            if i in sync_set:
+                h = pt.sync_module(per_track, block_start)
+                block_start = h
+                per_track = [h for _ in pt.text_models]
+        want = pt.lm_head(tm0.norm(h))
+
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+    # Non-vacuous: post-attn on the same weights and schedule is a different network.
+    pt.set_sync_phase("post-attn")
+    with torch.no_grad():
+        other, _ = pt(input_ids=input_ids, attention_mask=attention_mask)
+    assert (other - want).abs().max().item() > 1e-3

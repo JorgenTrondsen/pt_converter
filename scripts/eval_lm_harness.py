@@ -155,8 +155,9 @@ def main() -> int:
                    help="Sync placement; DEFAULT reads it from the checkpoint's "
                         "train_meta.json (else post-attn). Scoring a model at the wrong phase "
                         "is a different network — a post-attn heal read as post-mlp measured "
-                        "0.553 vs its true 0.700. 'post-attn'=lever B (heal schedule); "
-                        "'post-mlp'=legacy walk; 'exact'=2 syncs/layer ≡ dense.")
+                        "0.553 vs its true 0.700. 'post-attn'=lever B, L+1 syncs; "
+                        "'post-mlp'=the attention sync dropped instead, L syncs; "
+                        "'exact'=2 syncs/layer ≡ dense.")
     p.add_argument("--fuse-tracks", type=int, default=None,
                    help="F rank-local tracks pool their partials at every non-sync sublayer "
                         "(N/F-track behaviour on N shards). DEFAULT reads it from the "

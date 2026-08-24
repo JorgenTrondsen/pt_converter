@@ -322,8 +322,15 @@ def main() -> int:
                         "not carry embed+lm_head over its peers' budget")
     p.add_argument("--sync-indices", default=None,
                    help="Comma-separated boundary layers (default: every layer = the d1b schedule)")
-    p.add_argument("--sync-phase", default="post-attn", choices=["post-attn"],
-                   help="Only lever B is built — the program's schedule")
+    p.add_argument("--sync-phase", default="post-attn", choices=["post-attn", "post-mlp"],
+                   help="WHICH sublayer's sync a boundary is. 'post-attn' (lever B, "
+                        "the program's schedule): sync after the boundary layer's token "
+                        "mixer, so its MLP reads the TRUE residual and its delta is "
+                        "carried un-summed; the final layer keeps a post-MLP sync for the "
+                        "head, so d1b costs L+1 all-reduces. 'post-mlp' (SPD's placement): "
+                        "the ATTENTION sync is the one dropped and a whole layer runs "
+                        "own-carry, so d1b costs L. The two are NOT budget-matched (65 vs "
+                        "64 at 64 layers). See PTWrappedModel.sync_sets().")
     p.add_argument("--fuse-tracks", type=int, default=1,
                    help="F shards pool their partials at every non-sync sublayer, so "
                         "a group computes as one F-wide track between syncs (an "
@@ -341,6 +348,18 @@ def main() -> int:
                         "slower — for A/B'ing the merge on real weights.")
     p.add_argument("--intra-window-mse", action="store_true",
                    help="Loss-only synced taps at non-boundary layers (the D>1 curriculum wants this)")
+    p.add_argument("--block-walk", choices=["tf", "fr"], default="tf",
+                   help="Which trajectory the block objective's CARRY comes from. 'tf' "
+                        "(default, and what every result on record was trained with): "
+                        "each window starts from the TEACHER's residual, so every tap "
+                        "measures that layer's own error. 'fr': each window starts from "
+                        "the STUDENT's own synced state (detached), so it trains on the "
+                        "input distribution it will actually see — the target is the "
+                        "teacher either way. Detached, so peak memory and step time are "
+                        "unchanged. ⚠ 'fr' is the old student-forcing at sf=1.0, deleted "
+                        "2026-07-30 as divergent — a verdict VOIDED by the block_mse "
+                        "clamp bug it ran under (see distill_step). ⚠ under 'fr' the "
+                        "probe's post-attn-phase rail is no longer a rail.")
     # Recipe constants (the 9B-record defaults).
     p.add_argument("--max-steps", type=int, default=4001)
     p.add_argument("--seq-len", type=int, default=2048)
@@ -482,6 +501,16 @@ def main() -> int:
                         "alignment rail, so include it. Costs ~2L extra resident "
                         "(B,T,H) teacher tensors and ~2 collectives/layer ON THOSE "
                         "STEPS ONLY.")
+    p.add_argument("--probe-detail", default="",
+                   help="Comma-separated layers to dump the UN-REDUCED breakdown at "
+                        "(e.g. '8,42,43,44,45,63'). Every other probe number is an "
+                        "average over the (B, T) axes, which can show that an error is "
+                        "CONCENTRATED but never WHERE. At these layers the merged rows "
+                        "additionally carry per-position err/den/cos/nr vectors and the "
+                        "top-32 hidden channels by error contribution. Rank 0 only "
+                        "(merged states come out of an all-reduce, so they are "
+                        "rank-identical); ~80 KB per layer/phase/walk. Default off = "
+                        "byte-identical output to before.")
     p.add_argument("--probe-dir", default=None,
                    help="Where --probe-steps writes rank{r}.jsonl (default "
                         "<out-dir>/probe). Keep it OFF '/' — that filesystem is a "
@@ -553,10 +582,14 @@ def main() -> int:
     if sync_layers[-1] != num_layers - 1:
         sync_layers.append(num_layers - 1)  # the head needs the final post-MLP sync
 
-    # One post-attn all-reduce per boundary, plus the head's post-MLP sync.
+    # post-attn: one all-reduce per boundary PLUS the head's post-MLP sync at the
+    # final layer. post-mlp: one per boundary, the final layer already being one.
+    # (`PTWrappedModel.sync_sets` is the authority; this only reports it before the
+    # model is built.)
+    n_syncs = len(sync_layers) + (1 if args.sync_phase == "post-attn" else 0)
     _log(rank, f"[init] n_tracks={manifest.n_tracks} world={layout.world_size} "
                f"boundaries={len(sync_layers)} phase={args.sync_phase} "
-               f"syncs={len(sync_layers) + 1} "
+               f"syncs={n_syncs} "
                f"fuse={args.fuse_tracks} -> {_describe_plan(plan, tracks_per_rank)}")
 
     # Before any per-track config is built — `build_per_track_text_config` reads the
@@ -765,9 +798,16 @@ def main() -> int:
         lambda_ce=args.lambda_ce,
         lambda_mag=args.lambda_mag,
         intra_window_mse=args.intra_window_mse,
+        block_walk=args.block_walk,
         ce_chunk_size=args.ce_chunk_size,
         tf_ckpt_min_segment=args.tf_ckpt_min_segment,
     )
+    # The block loop's carry is the difference between "reproduce the teacher from a
+    # perfect input" and "reproduce it from your own drift" — worth one line, since
+    # every recorded result is `tf` and a mislabelled arm is uncomparable.
+    _log(rank, f"[init] objective: block_walk={args.block_walk} "
+               f"lambda_block={args.lambda_block} lambda_ce={args.lambda_ce} "
+               f"lambda_mag={args.lambda_mag}")
     out_dir = Path(args.out_dir)
     best_macro = float("-inf")
     step = 0
@@ -800,6 +840,9 @@ def main() -> int:
             out_dir=args.probe_dir or (out_dir / "probe"),
             device=torch.cuda.current_device(),
             teacher_layers=teacher.text_models[0].layers,
+            sync_phase=args.sync_phase,
+            block_walk=args.block_walk,
+            detail_layers={int(x) for x in args.probe_detail.split(",") if x.strip()},
         )
         _log(rank, f"[init] activation probe at steps {sorted(probe_steps)} -> "
                    f"{args.probe_dir or (out_dir / 'probe')} "
@@ -887,7 +930,8 @@ def main() -> int:
                 distill_step(student, teacher, lm_head, probe_batch,
                              replace(dcfg, lambda_block=0.0, lambda_ce=0.0),
                              probe=probe)
-            for line in summary_lines(probe.flush(), step):
+            for line in summary_lines(probe.flush(), step, sync_phase=args.sync_phase,
+                                     block_walk=args.block_walk):
                 _log(rank, line)
         losses = distill_step(
             student, teacher, lm_head, batch, dcfg,

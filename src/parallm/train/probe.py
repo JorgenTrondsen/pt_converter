@@ -104,6 +104,33 @@ def _mmean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
     return _msum(x, mask) / mask.sum().clamp(min=1)
 
 
+def pair_terms(
+    s: torch.Tensor,
+    t: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The four PER-TOKEN (B, T) tensors every pair metric is built from.
+
+    Split out from `pair_stats` because the (B, T) axis is where the interesting
+    structure lives and the aggregate throws it away. ⚠ ``err`` and ``den`` are
+    returned SEPARATELY, not as a ratio: the aggregate relMSE is ``Σerr / Σden``
+    — a norm-WEIGHTED quantity — while ``cos`` and ``ratio`` are reduced by an
+    UNWEIGHTED mean. That asymmetry is exactly why a handful of high-‖t‖
+    positions can move relMSE 13x while cos and ratio, diluted by ~2000 ordinary
+    tokens, do not move at all. Keeping both terms lets a per-position dump
+    reproduce the aggregate exactly, which is the rail on the dump.
+    """
+    s = s.float()
+    t = t.float()
+    s_n = s.pow(2).sum(-1).sqrt()
+    t_n = t.pow(2).sum(-1).sqrt()
+    cos = (s * t).sum(-1) / (s_n * t_n).clamp(min=eps)
+    ratio = s_n / t_n.clamp(min=eps)
+    err = (s - t).pow(2).sum(-1)
+    den = t.pow(2).sum(-1)
+    return cos, ratio, err, den
+
+
 def pair_stats(
     s: torch.Tensor,
     t: torch.Tensor,
@@ -118,14 +145,8 @@ def pair_stats(
     pair and this runs a few thousand pairs per probe step, so it keeps
     everything on device and returns 0-dim tensors rather than floats.
     """
-    s = s.float()
-    t = t.float()
-    s_n = s.pow(2).sum(-1).sqrt()
-    t_n = t.pow(2).sum(-1).sqrt()
-    cos = (s * t).sum(-1) / (s_n * t_n).clamp(min=eps)
-    ratio = s_n / t_n.clamp(min=eps)
-    relmse = _msum((s - t).pow(2).sum(-1), mask) / _msum(t.pow(2).sum(-1), mask).clamp(min=eps)
-    return _mmean(cos, mask), _mmean(ratio, mask), relmse
+    cos, ratio, err, den = pair_terms(s, t, eps)
+    return _mmean(cos, mask), _mmean(ratio, mask), _msum(err, mask) / _msum(den, mask).clamp(min=eps)
 
 
 def track_gram(deltas: list[torch.Tensor], mask: torch.Tensor | None,
@@ -238,6 +259,10 @@ class ActivationProbe:
         out_dir: str | Path,
         device,
         teacher_layers,
+        sync_phase: str = "post-attn",
+        block_walk: str = "tf",
+        detail_layers: "set[int] | None" = None,
+        detail_topk: int = 32,
     ):
         self.L = num_layers
         self.K = n_streams
@@ -264,18 +289,44 @@ class ActivationProbe:
         }
         self.path = Path(out_dir) / f"rank{rank}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.sync_phase = sync_phase
+        self.block_walk = block_walk
         self._meta = {
             "rank": rank,
             "num_layers": num_layers,
             "streams_per_rank": n_streams,
             "shards_per_stream": shards_per_stream,
             "stream_offset": stream_offset,
+            "sync_phase": sync_phase,
+            "block_walk": block_walk,
+            "detail_layers": sorted(detail_layers or ()),
             "metrics": list(METRICS),
         }
         self._wrote_meta = False
         self.step = -1
         self.mask = None
         self.caps: dict = {}
+        # Overrides `attention_mask` when set: 1 only at the positions the metric
+        # should read. Every reduction in this file goes through `_msum`/`_mmean`,
+        # and `track_gram`'s masked path is proven equal to slicing
+        # (tests/test_activation_probe.py), so this restricts the WHOLE panel to a
+        # position set for free. Used to CONFIRM a culprit set that the detail dump
+        # below has already found.
+        self.score_mask: torch.Tensor | None = None
+        # The probe batch's token ids, stamped into the meta once so a position
+        # index in a detail row decodes to a token.
+        self.input_ids: torch.Tensor | None = None
+        # Layers to dump the un-reduced (B, T) and per-channel breakdown at.
+        # Everything else in this file is an average over both axes, which can show
+        # that an error is CONCENTRATED but never where.
+        self.detail_layers = set(detail_layers or ())
+        self.detail_topk = detail_topk
+        self._detail: dict = {}
+        # Free-running merged rows, scored against the same teacher captures as the
+        # teacher-forced ones. No per-track dimension: the student's own walk hands
+        # back synced states, not per-track ones.
+        self._fr = torch.full((num_layers, 2, _M), float("nan"),
+                              device=device, dtype=torch.float32)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -288,13 +339,84 @@ class ActivationProbe:
         self.student_norm = student_norm
         return self
 
-    def begin(self, attention_mask: torch.Tensor | None) -> dict:
-        """Reset for a probe step; returns the dict the teacher forward fills."""
-        self.mask = attention_mask
+    def begin(self, attention_mask: torch.Tensor | None,
+              input_ids: torch.Tensor | None = None) -> dict:
+        """Reset for a probe step; returns the dict the teacher forward fills.
+
+        ``score_mask`` wins over ``attention_mask`` when set — see that attribute.
+        """
+        self.mask = self.score_mask if self.score_mask is not None else attention_mask
+        if input_ids is not None:
+            self.input_ids = input_ids
         self.caps = {}
         self._buf.fill_(float("nan"))
+        self._fr.fill_(float("nan"))
         self._dnorm_sum.zero_()
+        self._detail = {}
         return self.caps
+
+    @torch.no_grad()
+    def _record_detail(self, layer: int, phase: str, walk: str,
+                       s: torch.Tensor, t: torch.Tensor) -> None:
+        """Un-reduced (B, T) and per-channel breakdown for one merged pair.
+
+        Only for layers named by ``--probe-detail``, and only on rank 0: `s` and `t`
+        here are always MERGED states, which come out of an all-reduce and are
+        therefore bit-identical on every rank, so one rank writing them loses
+        nothing. (Per-TRACK tensors are rank-disjoint and must never be dumped this
+        way.) The work itself is rank-uniform — it issues no collective, but neither
+        does it skip one.
+        """
+        if layer not in self.detail_layers or self.rank != 0:
+            return
+        cos, ratio, err, den = pair_terms(s.detach(), t.detach())
+        sd, td = s.detach().float(), t.detach().float()
+        # Per channel: which hidden dims carry the error, and how big the teacher's
+        # own activation is there. A few dims holding most of Σerr, at a position
+        # where |t| is huge, is the massive-activation signature.
+        axes = tuple(range(sd.ndim - 1))
+        err_c = (sd - td).pow(2).sum(axes)
+        t_absmax_c = td.abs().amax(dim=axes)
+        k = min(self.detail_topk, err_c.numel())
+        top_c = torch.topk(err_c, k)
+        self._detail[(layer, phase, walk)] = {
+            "err": err.flatten().cpu(),
+            "den": den.flatten().cpu(),
+            "cos": cos.flatten().cpu(),
+            "nr": ratio.flatten().cpu(),
+            "chan_idx": top_c.indices.cpu(),
+            "chan_err": top_c.values.cpu(),
+            "chan_tmax": t_absmax_c[top_c.indices].cpu(),
+            "chan_err_total": float(err_c.sum()),
+        }
+
+    @torch.no_grad()
+    def record_fr(self, caps: dict) -> None:
+        """Score the student's own FREE-RUNNING states against the teacher's.
+
+        The teacher-forced rows reset the carry to the teacher at every boundary, so
+        each is that layer's OWN error — by construction they cannot see error
+        ACCUMULATE, and at d1b they sit near the bf16 floor for most of the stack.
+        Every downstream number is free-running. So the two walks measure different
+        functions, and until this landed the probe only ever ran the first one (the
+        probe step zeroes ``lambda_ce``, which skipped the free-running forward
+        entirely). The ratio FR/TF at a depth is that layer's error AMPLIFICATION:
+        how much it inflates the drift handed to it, over its error given a perfect
+        input.
+
+        ``caps`` is the student forward's own ``probe_capture``, so these are its
+        SYNCED states at the schedule it deploys at — the same tensors, scored
+        against the same teacher captures, under the same mask. Which depths appear
+        follows `PTWrappedModel.sync_sets()`, i.e. the seam column of the phase.
+        """
+        for (i, ph), s in caps.items():
+            if i < 0 or (i, ph) not in self.caps:
+                continue
+            t = self.caps[(i, ph)].detach()
+            self._fr[i, PHASES.index(ph), 0:3] = torch.stack(
+                pair_stats(s.detach(), t, self.mask)
+            )
+            self._record_detail(i, ph, "fr", s, t)
 
     def teacher_state(self, layer: int, phase: str) -> torch.Tensor:
         return self.caps[(layer, phase)]
@@ -366,6 +488,7 @@ class ActivationProbe:
         merged = merged.detach()
 
         self._buf[layer, p, self.K, 0:3] = torch.stack(pair_stats(merged, t_state, mask))
+        self._record_detail(layer, phase, "tf", merged, t_state)
         self._buf[layer, p, self.K, 3:6] = torch.stack(pair_stats(sum_delta, t_delta, mask))
         self._buf[layer, p, self.K, 9] = _mmean(
             sum_delta.float().pow(2).sum(-1).sqrt(), mask
@@ -384,19 +507,30 @@ class ActivationProbe:
     def flush(self) -> dict:
         """One collective, one host transfer, then append the step's rows.
 
-        Returns a small ``{layer: (attn_relmse, mlp_relmse)}`` digest of the merged
-        rows for the caller's stdout line.
+        Returns a small ``{layer: (tf_attn, tf_mlp, fr_attn, fr_mlp)}`` digest of the
+        merged relMSE for the caller's stdout line. The FR entries are NaN until a
+        free-running forward has been scored (`record_fr`).
         """
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(self._dnorm_sum, op=dist.ReduceOp.SUM)
         buf = self._buf.cpu()
         dsum = self._dnorm_sum.cpu()
+        fr = self._fr.cpu()
 
         rows = []
         for i in range(self.L):
             for p, phase in enumerate(PHASES):
-                if torch.isnan(buf[i, p]).all():
+                if torch.isnan(buf[i, p]).all() and torch.isnan(fr[i, p]).all():
                     continue  # a phase the schedule never reached
+                # The free-running row: same layer, same phase, same teacher target,
+                # the student's OWN walk instead of the teacher-forced one.
+                if not torch.isnan(fr[i, p]).all():
+                    rows.append({
+                        "step": self.step, "rank": self.rank, "layer": i,
+                        "phase": phase, "track": -1, "walk": "fr",
+                        **{m: (None if v != v else round(float(v), 6))
+                           for m, v in zip(METRICS, fr[i, p])},
+                    })
                 for k in range(self.K + 1):
                     vals = buf[i, p, k]
                     if torch.isnan(vals).all():
@@ -407,6 +541,7 @@ class ActivationProbe:
                         "rank": self.rank,
                         "layer": i,
                         "phase": phase,
+                        "walk": "tf",
                         "track": -1 if merged else self.stream_offset + k,
                     }
                     # NaN → null: "not applicable here", never a fabricated 0.
@@ -419,6 +554,30 @@ class ActivationProbe:
                         row["coh"] = round(float(vals[9]) / denom, 6) if denom > 0 else None
                     rows.append(row)
 
+        # Detail rows carry LISTS, not the METRICS columns, so they are tagged
+        # `detail` and every existing view filters them out via `walk`/`track`.
+        for (i, phase, walk), d in sorted(self._detail.items()):
+            rows.append({
+                "step": self.step, "rank": self.rank, "layer": i, "phase": phase,
+                "walk": walk, "track": -1, "detail": "position",
+                # err and den SEPARATELY: Σerr/Σden must reproduce this row's
+                # res_relmse exactly, which is the rail on the whole dump.
+                "err": [round(v, 9) for v in d["err"].tolist()],
+                "den": [round(v, 6) for v in d["den"].tolist()],
+                "cos": [round(v, 6) for v in d["cos"].tolist()],
+                "nr": [round(v, 6) for v in d["nr"].tolist()],
+            })
+            rows.append({
+                "step": self.step, "rank": self.rank, "layer": i, "phase": phase,
+                "walk": walk, "track": -1, "detail": "channel",
+                "chan_idx": d["chan_idx"].tolist(),
+                "chan_err": [round(v, 9) for v in d["chan_err"].tolist()],
+                "chan_tmax": [round(v, 6) for v in d["chan_tmax"].tolist()],
+                "chan_err_total": round(d["chan_err_total"], 9),
+            })
+
+        if self.input_ids is not None and "input_ids" not in self._meta:
+            self._meta["input_ids"] = self.input_ids.flatten().tolist()
         with self.path.open("a") as fh:
             if not self._wrote_meta:
                 fh.write(json.dumps({"meta": self._meta}) + "\n")
@@ -427,28 +586,82 @@ class ActivationProbe:
                 fh.write(json.dumps(row) + "\n")
 
         return {
-            i: (float(buf[i, 0, self.K, 2]), float(buf[i, 1, self.K, 2]))
+            i: (float(buf[i, 0, self.K, 2]), float(buf[i, 1, self.K, 2]),
+                float(fr[i, 0, 2]), float(fr[i, 1, 2]))
             for i in range(self.L)
         }
 
 
-def summary_lines(digest: dict, step: int, every: int = 8) -> list[str]:
+def summary_lines(digest: dict, step: int, every: int = 8,
+                  sync_phase: str = "post-attn", block_walk: str = "tf") -> list[str]:
     """A few lines of merged-row relMSE for the run log — the full grid is in the
     JSONL, this is only enough to see at a glance that the probe ran and that the
-    alignment rail is where it should be.
+    second line is where it should be.
 
-    The rail is the post-MLP column at EVERY layer — the TF loop reconstructs each
-    layer's post-MLP from the teacher's own residual, so a non-floor value means the
-    probe is misaligned. Post-attn rows are supposed to be non-zero: that is the d1b
-    seam. (The final layer was exempt until 2026-08-18, when it became a boundary.)
+    ⚠ **The two columns SWAP ROLES with the phase.** Each phase has one column fed
+    the teacher-exact residual (the RAIL — ≈0 while student weights == teacher
+    weights, and a non-floor value means the probe is misaligned, not that the model
+    is bad) and one fed OWN-CARRY (the SEAM — the sync this phase drops, structurally
+    non-zero even with identical weights):
+
+    | phase     | rail column | seam column |
+    |-----------|-------------|-------------|
+    | post-attn | post-mlp    | post-attn   |
+    | post-mlp  | post-attn   | post-mlp    |
+
+    So the cross-phase comparison is SEAM to SEAM — post-attn's `attn` column against
+    post-mlp's `mlp` column — NOT column to column by name. (Measured untrained at
+    32B/N=64/d1b: seam@L63 0.0210 post-attn vs 0.0514 post-mlp.) Printing post-mlp's
+    seam as a rail read 2.43 at L0 and meant nothing; that value is the tiny early
+    residual norm in the denominator, not misalignment.
+
+    (At post-attn the final layer was exempt from the rail until 2026-08-18, when it
+    became a full boundary.)
+
+    ⚡ The **third line is the one to read**: the FREE-RUNNING seam, and `amp = FR/TF`.
+    The TF rows above cannot see error ACCUMULATE — they hand every layer the teacher's
+    residual — while every downstream number is free-running. `amp` is how much a layer
+    inflates the drift it is handed over its error given a perfect input.
     """
+    seam = 1 if sync_phase == "post-mlp" else 0   # which column is the own-carry one
     layers = sorted(digest)
     last = layers[-1]
     picked = [i for i in layers if i % every == 0 or i == last]
     body = " ".join(f"{i}:{digest[i][0]:.4f}/{digest[i][1]:.5f}" for i in picked)
-    rail = max(digest[i][1] for i in layers)
-    return [
+    worst = max(digest[i][1] for i in layers)
+    if sync_phase == "post-mlp":
+        tail = (f"[probe] step {step} post-mlp seam: max merged relMSE over all "
+                f"{len(layers)} layers = {worst:.2e} (the dropped sync — NOT a rail)")
+    elif block_walk != "tf":
+        # The rail only exists because the boundary MLP reads the TEACHER's residual.
+        # Under a free-running carry it reads the student's own drift instead, so this
+        # column measures that drift and has no floor to sit at.
+        tail = (f"[probe] step {step} post-mlp seam: max merged relMSE over all "
+                f"{len(layers)} layers = {worst:.2e} "
+                f"(NOT a rail at block_walk={block_walk} — the carry is not teacher-exact)")
+    else:
+        tail = (f"[probe] step {step} alignment rail: max post-mlp merged relMSE over all "
+                f"{len(layers)} layers = {worst:.2e} (≈0 while student==teacher weights)")
+    lines = [
         f"[probe] step {step} merged relMSE attn/mlp @L{{{','.join(str(i) for i in picked)}}}: {body}",
-        f"[probe] step {step} alignment rail: max post-mlp merged relMSE over all "
-        f"{len(layers)} layers = {rail:.2e} (≈0 while student==teacher weights)",
+        tail,
     ]
+    # NaN when no free-running forward was scored (`record_fr` never called).
+    fr = {i: digest[i][2 + seam] for i in layers if digest[i][2 + seam] == digest[i][2 + seam]}
+    if fr:
+        shown = [i for i in picked if i in fr]
+        fr_body = " ".join(f"{i}:{fr[i]:.4f}" for i in shown)
+        head = f"[probe] step {step} FREE-RUNNING seam @L{{{','.join(str(i) for i in shown)}}}: {fr_body}"
+        if block_walk != "tf":
+            # The block loop already carries the free-running trajectory, so the two
+            # walks compute the same states and amp is 1 by construction. Printing it
+            # as a ratio would dress an identity up as a measurement. (That the two
+            # agree to 4 decimals IS worth something — it says the carry is wired to
+            # the trajectory the model actually runs.)
+            lines.append(f"{head} | amp N/A at block_walk={block_walk} (this IS the block walk)")
+        else:
+            amps = [fr[i] / digest[i][seam] for i in fr if digest[i][seam] > 0]
+            lines.append(
+                f"{head} | median amp {sorted(amps)[len(amps) // 2]:.0f}x" if amps else head
+            )
+    return lines

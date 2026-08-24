@@ -390,3 +390,37 @@ def test_merge_group_1_is_untouched():
         _run(dense, cfg, 4, sync_after, 1, input_ids),
         _run(dense, cfg, 4, sync_after, 1, input_ids, merge_group=1),
     )
+
+
+def test_post_mlp_batched_exec_equals_the_looped_model():
+    """post-mlp on the BATCHED fold must equal post-mlp on the looped path.
+
+    This is the capability the unification added: post-mlp used to be a second,
+    hand-mirrored walk that never called `fuse`, so it had to REFUSE
+    `fuse_size/exec_groups/fuse_ranks > 1` — i.e. it could not run on any real
+    qwen3-32B/N=64 training config (`exec_groups=8` at F=1). Expressing it as
+    `(attn={}, mlp=boundaries)` on the one walk gets it the merged/batched path,
+    and this rail is what says the two paths agree.
+
+    Sparse schedule on purpose: at d1b every layer syncs and own-carry — the only
+    place a wrong grouping shows — never happens.
+    """
+    cfg = _nesting_config()
+    torch.manual_seed(0)
+    dense = Qwen3_5TextModel(cfg)
+    dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+    dense.eval()
+
+    sync_after = [1, 3, cfg.num_hidden_layers - 1]
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 16), generator=torch.manual_seed(123))
+
+    looped = _run(dense, cfg, 4, sync_after, 1, input_ids, phase="post-mlp")
+    batched = _run(dense, cfg, 1, sync_after, 1, input_ids,
+                   merge_group=4, exec_groups=4, phase="post-mlp")
+    drift = (batched - looped).abs().max().item()
+    assert drift < 1e-4, f"batched post-mlp != looped post-mlp: max |dlogit| {drift}"
+
+    # Non-vacuous: post-mlp is a genuinely different network from post-attn on the
+    # same weights and the same boundaries — it drops the attention sync instead.
+    post_attn = _run(dense, cfg, 4, sync_after, 1, input_ids, phase="post-attn")
+    assert (looped - post_attn).abs().max().item() > 1e-3
